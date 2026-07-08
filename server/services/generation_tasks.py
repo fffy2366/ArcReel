@@ -209,6 +209,36 @@ def assert_duration_supported(duration: int | float | str, supported_durations: 
         )
 
 
+def _normalize_manxue_1ren_duration(
+    provider_id: str | None,
+    model_id: str | None,
+    duration: int | float | str,
+    supported_durations: list[int],
+) -> int | float | str:
+    if not model_id or not str(model_id).startswith("1ren-dance-2"):
+        return duration
+    if provider_id and not (provider_id == "manxue" or str(provider_id).startswith("custom-")):
+        return duration
+    if not supported_durations:
+        return duration
+    try:
+        numeric = float(duration)
+    except (TypeError, ValueError):
+        return duration
+    if not numeric.is_integer():
+        return duration
+    seconds = int(numeric)
+    if seconds in supported_durations:
+        return seconds
+    resolved = min(supported_durations, key=lambda allowed: abs(allowed - seconds))
+    logger.info(
+        "Manxue 1ren duration %s is unsupported before execution; using nearest supported duration %s",
+        seconds,
+        resolved,
+    )
+    return resolved
+
+
 def _collect_sheet_references(
     project: dict,
     project_path: Path,
@@ -859,6 +889,12 @@ async def execute_video_task(
         )
     # 能力守卫：provider 解析之后的唯一权威家（见 ADR-0001）。安全解析交给守卫，
     # 此处不预先 int() 截断，避免把非整数秒静默修正成「碰巧合法」的值。
+    duration_seconds = _normalize_manxue_1ren_duration(
+        registry_provider_id,
+        model_name,
+        duration_seconds,
+        supported_durations,
+    )
     assert_duration_supported(duration_seconds, supported_durations)
 
     # end_frame_image 是镜头持久属性（见 server/services/end_frame.py），剧本每次加载都带出，
