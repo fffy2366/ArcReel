@@ -136,6 +136,10 @@ class ScriptGenerator:
         """按 episode → project → 默认 storyboard 回退解析 generation_mode。"""
         return effective_mode(project=self.project_json, episode=self._episode_entry(episode))
 
+    def _uses_reference_video_script(self, episode: int) -> bool:
+        """Return True when this episode must use the video_units script shape."""
+        return self.content_mode != "ad" and self._effective_generation_mode(episode) == "reference_video"
+
     @staticmethod
     def _entry_outline(entry: dict) -> dict:
         """账本条目的 outline 字段归一化为 dict（缺失/形状异常返回空 dict）。"""
@@ -886,7 +890,7 @@ class ScriptGenerator:
         # ad 剧本骨架唯一、不携带"视频来源"维度：不打 generation_mode 戳——按剧本级
         # generation_mode 分派的消费方（StatusCalculator / enqueue 判别等）会被该戳
         # 误导去找不存在的 video_units。
-        if self.content_mode != "ad" and gen_mode == "reference_video":
+        if self._uses_reference_video_script(episode):
             script_data["content_mode"] = self.content_mode
             script_data["generation_mode"] = "reference_video"
         else:
@@ -958,8 +962,6 @@ class ScriptGenerator:
             # isinstance 守卫避免 `for` 迭代崩溃（外层 try/except 会吞异常但会误跳过整段探针）。
             raw_items = script_data.get(kind)
             items = raw_items if isinstance(raw_items, list) else []
-            if kind == "video_units":
-                for u in items:
                     if not isinstance(u, dict):
                         continue
                     uid = str(u.get(id_key) or "?")
