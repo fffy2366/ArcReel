@@ -50,8 +50,29 @@ from server.agent_runtime.sdk_tools._context import ToolContext, fetch_video_cap
 logger = logging.getLogger(__name__)
 
 
+# 拒绝持久化 step1 规范化输出里的思考痕迹：thinking/reasoning 等模型内部字段
+# 偶尔被结构化通道透传，含此类键或 <think> 文本片段的响应直接 fail-loud。
+_THINKING_TEXT_MARKERS = ("<think", "</think>")
+_THINKING_TOP_LEVEL_KEYS = {"think", "thinking", "thought", "reasoning", "reasoning_content", "analysis"}
+
+
+def _reject_thinking_trace(response_text: str, data: dict[str, Any] | None = None) -> None:
+    """step1 规范化输出若夹带模型思考痕迹（<think> 文本片段或 thinking/reasoning
+    等顶层字段），直接抛 ValueError 拒绝持久化，避免非结构化思考流被误当成正式
+    step1 JSON 落盘（drama normalize 调用 _parse_normalized_content 路径必经）。
+    """
+    lowered = response_text.lower()
+    if any(marker in lowered for marker in _THINKING_TEXT_MARKERS):
+        raise ValueError("step1 normalized content contains model thinking trace; refused to persist non-structured output")
+    if data is not None:
+        bad_keys = sorted(_THINKING_TOP_LEVEL_KEYS.intersection(str(key).lower() for key in data.keys()))
+        if bad_keys:
+            joined = ", ".join(bad_keys)
+            raise ValueError(f"step1 normalized content contains top-level thinking fields ({joined}); refused to persist")
+
+
 def _parse_step1_json(response_text: str, model: type[BaseModel], *, label: str, top_shape: str) -> dict:
-    """解析并校验 step1 结构化响应为 dict；校验失败 fail-loud 抛 ValueError，不返回未校验内容。
+    """解析并校验 step1 结构化响应为 dict；校验失败 fail-loud 抛 ValueError，不返回未校验内容。"""
 
     ``model`` 取自调用处用 ``supported_durations`` 构造的同一份动态 schema（即 response_schema），
     令本地校验与 response_schema 同口径：即使 backend 未严格执行 schema，超出 supported_durations
@@ -75,6 +96,7 @@ def _parse_step1_json(response_text: str, model: type[BaseModel], *, label: str,
 
 def _parse_normalized_content(response_text: str, model: type[BaseModel]) -> dict:
     """drama step1（normalize）响应解析：见 ``_parse_step1_json``。"""
+    _reject_thinking_trace(response_text)
     return _parse_step1_json(response_text, model, label="step1 规范化内容", top_shape="{title, scenes}")
 
 
