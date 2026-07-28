@@ -962,6 +962,8 @@ class ScriptGenerator:
             # isinstance 守卫避免 `for` 迭代崩溃（外层 try/except 会吞异常但会误跳过整段探针）。
             raw_items = script_data.get(kind)
             items = raw_items if isinstance(raw_items, list) else []
+            if kind == "video_units":
+                for u in items:
                     if not isinstance(u, dict):
                         continue
                     uid = str(u.get(id_key) or "?")

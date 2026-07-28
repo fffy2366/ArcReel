@@ -559,7 +559,19 @@ class TestScriptGenerator:
                 "_supported_durations": [10, 15],
             },
         )
-        _write(project_path / "drafts" / "episode_1" / "step1_reference_units.md", "- E1U01: reference unit")
+        # HEAD 项目有独立的 _load_reference_step1，会校验结构化 .json（不是 .md）。
+        # 提供最小合法的 step1_reference_units.json，让脚本生成走到 schema 选择阶段。
+        _write_json(
+            project_path / "drafts" / "episode_1" / "step1_reference_units.json",
+            {
+                "units": [
+                    {
+                        "unit_id": "E1U01",
+                        "shots": [{"duration": 10, "text": "shot one"}],
+                    }
+                ],
+            },
+        )
 
         fake = _FakeTextGenerator(json.dumps({"foo": "bar"}))
         generator = ScriptGenerator(project_path, generator=fake)
