@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import logging
 import json
+import logging
 
 from openai import AsyncOpenAI, BadRequestError
 from pydantic import BaseModel, ValidationError
@@ -91,9 +91,25 @@ class OpenAITextBackend:
                 token_param=self._max_tokens_param,
             )
 
+        # prompted_json_schema 通道（如 MiniMax）需先规范化响应文本再走 fallback 判定，
+        # 否则 ``structured_fallback_reason`` 会误把合法的 JSON 视作非结构化输出触发
+        # 无谓的 Instructor 降级。
+        prompted_json_schema = request.response_schema and _uses_prompted_json_schema(self._provider_name, self._model)
+        if prompted_json_schema:
+            normalized_text = _normalize_prompted_json_text(native.text, request.response_schema)
+            if not is_valid_json(normalized_text):
+                raise ValueError(f"{self._provider_name}/{self._model} returned non-JSON content")
+            native.text = normalized_text
+
         if request.response_schema:
             fallback_reason = structured_fallback_reason(native.text, request.response_schema)
             if fallback_reason:
+                if prompted_json_schema and is_valid_json(native.text):
+                    logger.warning(
+                        "prompt JSON %s; returning parseable JSON and skipping Instructor fallback",
+                        fallback_reason,
+                    )
+                    return native
                 logger.warning(
                     "原生 response_format %s，降级到带校验的 Instructor 路径",
                     fallback_reason,
@@ -161,41 +177,6 @@ class OpenAITextBackend:
         choice = response.choices[0]
         output_tokens = usage.completion_tokens if usage else None
         text = choice.message.content or ""
-
-        prompted_json_schema = request.response_schema and _uses_prompted_json_schema(
-            self._provider_name, self._model
-        )
-        if prompted_json_schema:
-            text = _normalize_prompted_json_text(text, request.response_schema)
-            if not is_valid_json(text):
-                raise ValueError(f"{self._provider_name}/{self._model} returned non-JSON content")
-
-        if request.response_schema:
-            fallback_reason = structured_fallback_reason(text, request.response_schema)
-            if fallback_reason:
-                if prompted_json_schema and is_valid_json(text):
-                    logger.warning(
-                        "prompt JSON %s; returning parseable JSON and skipping Instructor fallback",
-                        fallback_reason,
-                    )
-                else:
-                    logger.warning(
-                        "native response_format %s; falling back to Instructor",
-                        fallback_reason,
-                    )
-                    result = await _instructor_fallback(
-                        self._client,
-                        self._model,
-                        request,
-                        messages,
-                        provider=self._provider_name,
-                        token_param=self._max_tokens_param,
-                    )
-                    # The native 200 response was billed; merge its tokens into fallback usage.
-                    if usage:
-                        result.input_tokens = (result.input_tokens or 0) + (usage.prompt_tokens or 0)
-                        result.output_tokens = (result.output_tokens or 0) + (usage.completion_tokens or 0)
-                    return result
 
         check_truncation(
             getattr(choice, "finish_reason", None),
@@ -359,8 +340,12 @@ def _normalize_episode_plan_item(item, response_schema: type | None = None):
         return item
     normalized = {
         "title": str(item.get("title") or item.get("name") or item.get("episode_title") or "Untitled").strip(),
-        "hook": str(item.get("hook") or item.get("cliffhanger") or item.get("teaser") or item.get("ending_hook") or "下一集继续").strip(),
-        "end_anchor": str(item.get("end_anchor") or item.get("anchor") or item.get("ending_anchor") or item.get("end") or "").strip(),
+        "hook": str(
+            item.get("hook") or item.get("cliffhanger") or item.get("teaser") or item.get("ending_hook") or "下一集继续"
+        ).strip(),
+        "end_anchor": str(
+            item.get("end_anchor") or item.get("anchor") or item.get("ending_anchor") or item.get("end") or ""
+        ).strip(),
     }
     if _episode_plan_needs_story_beats(response_schema):
         beats = item.get("story_beats") or item.get("beats") or item.get("outline")
@@ -602,10 +587,7 @@ _CAMERA_MOTION_ALIASES = {
 def _normalize_script_like_payload(data, *, root: bool = True):
     """Normalize common LLM drift in ArcReel script-shaped JSON."""
     if isinstance(data, dict):
-        normalized = {
-            key: _normalize_script_like_payload(value, root=False)
-            for key, value in data.items()
-        }
+        normalized = {key: _normalize_script_like_payload(value, root=False) for key, value in data.items()}
         if root:
             for wrapper_key in ("response", "result", "data", "script", "episode"):
                 wrapped = normalized.get(wrapper_key)
