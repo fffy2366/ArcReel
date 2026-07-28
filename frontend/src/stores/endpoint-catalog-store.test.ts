@@ -117,6 +117,7 @@ describe("endpoint-catalog-store", () => {
       request_method: "POST",
       request_path_template: "/v1/videos",
       image_capabilities: null,
+      end_image_capable: false,
     });
   });
 
@@ -130,7 +131,9 @@ describe("endpoint-catalog-store", () => {
     // 非 video 类恒为 false，且每个 endpoint 都有条目——控件读不到条目会误判成「不支持尾帧」
     expect(map["openai-chat"]).toBe(false);
     expect(map["openai-images"]).toBe(false);
-    expect(Object.keys(map)).toHaveLength(FIXTURE.length);
+    // FIXTURE 加 LOCAL_ENDPOINT_PATCHES（manxue-seedance-video 后注入）合并后所有
+    // endpoint 都需出现在 map 中，控件读不到条目会误判成「不支持尾帧」。
+    expect(Object.keys(map)).toHaveLength(FIXTURE.length + 1);
   });
 
   it("fetch short-circuits after initialized", async () => {

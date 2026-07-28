@@ -40,6 +40,7 @@ const LOCAL_ENDPOINT_PATCHES: EndpointDescriptor[] = [
     request_method: "POST",
     request_path_template: "/v1/videos",
     image_capabilities: null,
+    end_image_capable: false,
   },
 ];
 
