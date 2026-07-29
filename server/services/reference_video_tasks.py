@@ -8,15 +8,17 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy.exc import SQLAlchemyError
 
 from lib.asset_types import ASSET_SPECS, BUCKET_KEY, SHEET_KEY
-from lib.config.resolver import ConfigResolver, get_provider_fallback
+from lib.config.resolver import ConfigResolver, constrain_durations, get_provider_fallback
 from lib.db import async_session_factory
 from lib.db.base import DEFAULT_USER_ID
+from lib.generation_queue import get_generation_queue
 from lib.path_safety import safe_exists
 from lib.prompt_builders import append_product_fidelity_tail, append_video_negative_tail
 from lib.reference_video import assemble_shots_text, render_prompt_for_backend
@@ -34,12 +36,22 @@ from lib.version_manager import VersionManager
 from server.services.generation_context import VideoLaneRequest, resolve_generation_context
 from server.services.generation_tasks import (
     collect_product_references_for_names,
-    constrain_durations_by_reference_images,
-    constrain_durations_by_resolution,
     get_project_manager,
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _persist_effective_duration(task_id: str, duration_seconds: int) -> None:
+    """把取档后实际申请的秒数写回 task payload，供 resume 路径读取（见调用点注释）。
+
+    非致命路径：持久化失败只降级 resume 元数据精度，不影响本次已在进行的生成，
+    故只记日志、不上抛阻断 executor 主流程。
+    """
+    try:
+        await get_generation_queue().persist_effective_duration(task_id, duration_seconds)
+    except Exception:
+        logger.warning("effective_duration 写回 payload 失败 task_id=%s", task_id, exc_info=True)
 
 
 def _resolve_unit_references(
@@ -171,7 +183,7 @@ def unit_script_duration(unit: dict, ad_shots: list[dict] | None) -> int:
 
 
 def effective_reference_durations(
-    provider: str,
+    provider_id: str,
     model: str | None,
     durations: list[int],
     resolution: str | None,
@@ -188,30 +200,76 @@ def effective_reference_durations(
     缺图会退化为纯文本，backend 同样只在 ``reference_images`` 非空时施加该约束——无图单元
     套用它会把 720p 下本可申请的 4 秒错误抬到 8 秒。
 
-    ``provider`` 必须是规范 registry provider id（backend 族名不是 registry key）。两条约束
-    都遵循「无声明或交集为空时不收窄」的降级口径（见各自实现），故本函数在能力声明缺位时
-    退化为原全集，不比收窄前更严。
+    ``provider_id`` 必须是规范 registry provider id（backend 族名不是 registry key）。两条约束
+    都遵循「无声明或交集为空时不收窄」的降级口径（见 :func:`lib.config.resolver.constrain_durations`），
+    故本函数在能力声明缺位时退化为原全集，不比收窄前更严。
     """
-    narrowed = (
-        constrain_durations_by_reference_images(provider, model, durations) if with_reference_images else durations
+    return constrain_durations(
+        provider_id, model, durations, resolution=resolution, uses_reference_images=with_reference_images
     )
-    return constrain_durations_by_resolution(provider, model, narrowed, resolution)
 
 
-async def precheck_unit_duration_slot(project: dict, unit: dict, ad_shots: list[dict] | None) -> DurationSlot:
-    """入队前按项目当前配置近似取档，供 Web 在生成入口确认「将按与剧本不一致的时长生成」。
+@dataclass(frozen=True)
+class ProjectDurationContext:
+    """项目视频能力的一次性 IO 解析结果：档位全集（未按单个 unit 条件收窄）+ 分辨率 + provider/model 身份。
 
-    provider 按 ADR-0001 在执行时才解析，故这里只是近似：能力解析失败按空档位处理
-    （沿用现状放行，不弹确认），实际档位以执行时的 model 能力为准。
+    由 :func:`resolve_project_duration_context` 产出，供 :func:`precheck_unit` 对批次内每个
+    unit 反复调用而不重新触发 DB IO——批量预检 N 个 unit 时项目能力/分辨率解析各只发生一次。
+    """
+
+    supported_durations: tuple[int, ...]
+    resolution: str | None
+    provider_id: str
+    model_name: str | None
+    max_duration: int | None = None
+
+
+async def resolve_project_duration_context(project: dict) -> ProjectDurationContext:
+    """一次性解析项目视频能力（档位全集 + 单次生成时长上限 + 分辨率 + provider/model 身份）。
+
+    解析失败按空档位处理（沿用现状放行，不弹确认）；分辨率仅在档位非空时才解析，
+    空档位下分辨率约束无意义。``max_duration`` 与 :func:`resolve_max_unit_duration`
+    取自同一份能力解析结果，供需要现推分组的调用方复用而不再触发一次 IO。
+    """
+    caps = await _project_video_caps(project, degraded_to="时长取档不施加档位约束")
+    durations = tuple(int(d) for d in caps.get("supported_durations") or [])
+    provider_id = str(caps.get("provider_id") or "")
+    model = caps.get("model")
+    model_name = str(model) if model else None
+    max_duration = caps.get("max_duration")
+    resolution = await _project_video_resolution(project, provider_id, model_name) if durations else None
+    return ProjectDurationContext(
+        supported_durations=durations,
+        resolution=resolution,
+        provider_id=provider_id,
+        model_name=model_name,
+        max_duration=int(max_duration) if max_duration else None,
+    )
+
+
+def precheck_unit(ctx: ProjectDurationContext, unit: dict, ad_shots: list[dict] | None) -> DurationSlot:
+    """按已解析的项目能力 context 为单个 unit 取档。纯函数，无 IO——批量调用方一次
+    :func:`resolve_project_duration_context` 后对每个 unit 反复调用，不重复 DB 往返。
+
+    provider 按 ADR-0001 在执行时才解析，故 ``ctx`` 只是近似：实际档位以执行时的 model
+    能力为准。
 
     「是否带参考图」按 unit 声明的 references 近似——执行层按解析后的实际图判定，而 ad 路径
     的资产缺图退化为纯文本要读盘才知道。近似方向保守：声明了参考却缺图的异常单元会多收窄
     一档、至多多问一次确认，不会漏掉需要确认的情形。
     """
-    return resolve_duration_slot(
-        unit_script_duration(unit, ad_shots),
-        await resolve_project_supported_durations(project, with_reference_images=bool(unit.get("references"))),
+    durations = (
+        effective_reference_durations(
+            ctx.provider_id,
+            ctx.model_name,
+            list(ctx.supported_durations),
+            ctx.resolution,
+            with_reference_images=bool(unit.get("references")),
+        )
+        if ctx.supported_durations
+        else []
     )
+    return resolve_duration_slot(unit_script_duration(unit, ad_shots), durations)
 
 
 async def _project_video_caps(project: dict, *, degraded_to: str) -> dict:
@@ -225,29 +283,6 @@ async def _project_video_caps(project: dict, *, degraded_to: str) -> dict:
     except (ValueError, SQLAlchemyError) as exc:
         logger.info("无法解析 video_capabilities，%s：%s", degraded_to, exc)
         return {}
-
-
-async def resolve_project_supported_durations(project: dict, *, with_reference_images: bool) -> list[int]:
-    """解析项目视频后端在参考视频路径下可申请的时长档位集。
-
-    档位已按本次调用的条件收窄（见 :func:`effective_reference_durations`），与执行层取档
-    同口径——否则预检展示的申请秒数会是执行期拿不到的值。解析失败返回空列表（与执行层
-    空集放行同口径）。
-    """
-    caps = await _project_video_caps(project, degraded_to="时长取档不施加档位约束")
-    durations = [int(d) for d in caps.get("supported_durations") or []]
-    if not durations:
-        return []
-    provider_id = str(caps.get("provider_id") or "")
-    model = caps.get("model")
-    model_name = str(model) if model else None
-    return effective_reference_durations(
-        provider_id,
-        model_name,
-        durations,
-        await _project_video_resolution(project, provider_id, model_name),
-        with_reference_images=with_reference_images,
-    )
 
 
 async def _project_video_resolution(project: dict, provider_id: str, model_id: str | None) -> str | None:
@@ -486,6 +521,16 @@ async def execute_reference_video_task(
             registry_provider_id=registry_provider_id,
             resolution=resolution,
         )
+
+    # 把实际申请的秒数写回 task payload：resume 路径（server.services.resume_executor）
+    # 读 payload["duration_seconds"] 重建申请参数，回退顺序是 payload > project.default_duration
+    # > 8。入队时（reference_videos 路由 / SDK 工具）payload 从不携带 duration_seconds，
+    # 不写回时回退到的是 project 默认时长，而非该 unit 自己的时长——二者不相等是常态，
+    # 不能仅在「取档偏移了剧本编排（adjustment != exact）」时才写回，未取档但仍偏离项目
+    # 默认值的 unit 同样需要。持久化失败只降级为 resume 元数据不够精确（回退到项目默认
+    # 时长，与本次改动前行为一致），不影响本次生成结果，不 fail-fast。
+    if task_id is not None:
+        await _persist_effective_duration(task_id, effective_duration)
 
     # 6. 渲染 prompt。ad：镜头文本 + 裁剪后参考的 [图N] 对照表 + 保真/反向尾词。
     #    narration/drama：@→[图N] 替换——必须按 `constrained_refs` 的长度裁

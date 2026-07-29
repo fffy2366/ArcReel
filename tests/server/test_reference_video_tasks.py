@@ -11,10 +11,12 @@ import pytest
 
 from lib.reference_video.errors import MissingReferenceError
 from server.services.reference_video_tasks import (
+    ProjectDurationContext,
     _apply_provider_constraints,
     _render_unit_prompt,
     _resolve_unit_references,
     effective_reference_durations,
+    precheck_unit,
 )
 
 
@@ -273,6 +275,106 @@ async def test_project_video_resolution_falls_back_like_executor(monkeypatch: py
 
     monkeypatch.setattr(rvt, "ConfigResolver", _FakeResolver)
     assert await rvt._project_video_resolution({}, "gemini-aistudio", "veo-3.1-generate-preview") == "1080p"
+
+
+@pytest.mark.unit
+async def test_resolve_project_duration_context_resolves_caps_and_resolution_once(monkeypatch: pytest.MonkeyPatch):
+    """项目能力与分辨率各只解析一次：批量预检把这次结果复用给每个 unit（见 precheck_unit）。"""
+    from server.services import reference_video_tasks as rvt
+
+    caps_calls = 0
+    resolution_calls = 0
+
+    async def fake_caps(_project, *, degraded_to):
+        nonlocal caps_calls
+        caps_calls += 1
+        return {"provider_id": "gemini-aistudio", "model": "veo-3.1-generate-preview", "supported_durations": [4, 6, 8]}
+
+    async def fake_resolution(_project, _provider_id, _model_id):
+        nonlocal resolution_calls
+        resolution_calls += 1
+        return "720p"
+
+    monkeypatch.setattr(rvt, "_project_video_caps", fake_caps)
+    monkeypatch.setattr(rvt, "_project_video_resolution", fake_resolution)
+
+    ctx = await rvt.resolve_project_duration_context({})
+
+    assert caps_calls == 1
+    assert resolution_calls == 1
+    assert ctx == ProjectDurationContext(
+        supported_durations=(4, 6, 8),
+        resolution="720p",
+        provider_id="gemini-aistudio",
+        model_name="veo-3.1-generate-preview",
+    )
+
+
+@pytest.mark.unit
+async def test_resolve_project_duration_context_skips_resolution_when_no_durations(monkeypatch: pytest.MonkeyPatch):
+    """档位不可解析时分辨率也不解析——空档位下分辨率约束无意义，省一趟 IO。"""
+    from server.services import reference_video_tasks as rvt
+
+    resolution_calls = 0
+
+    async def fake_caps(_project, *, degraded_to):
+        return {}
+
+    async def fake_resolution(*_a, **_kw):
+        nonlocal resolution_calls
+        resolution_calls += 1
+        return "720p"
+
+    monkeypatch.setattr(rvt, "_project_video_caps", fake_caps)
+    monkeypatch.setattr(rvt, "_project_video_resolution", fake_resolution)
+
+    ctx = await rvt.resolve_project_duration_context({})
+
+    assert resolution_calls == 0
+    assert ctx.supported_durations == ()
+    assert ctx.resolution is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("total_seconds", "with_references", "expected_seconds", "expected_adjustment"),
+    [
+        (8, True, 8, "exact"),
+        (5, True, 8, "up"),
+        (20, True, 8, "down"),
+        (5, False, 6, "up"),
+    ],
+)
+def test_precheck_unit_is_pure_and_matches_slot_semantics(
+    total_seconds, with_references, expected_seconds, expected_adjustment
+):
+    """precheck_unit 不触 DB，按 ctx 里已解析好的档位/分辨率为单个 unit 取档；带图/不带图
+    条件档位求交（Veo 3.1 720p 带图仅 8 秒、不带图仍是全集）与容量语义（exact/up/down）
+    行为与重构前一致。"""
+    ctx = ProjectDurationContext(
+        supported_durations=(4, 6, 8),
+        resolution="720p",
+        provider_id="gemini-aistudio",
+        model_name="veo-3.1-generate-preview",
+    )
+    unit = {
+        "duration_seconds": total_seconds,
+        "references": [{"type": "character", "name": "张三"}] if with_references else [],
+    }
+    slot = precheck_unit(ctx, unit, None)
+    assert slot.seconds == expected_seconds
+    assert slot.adjustment == expected_adjustment
+
+
+@pytest.mark.unit
+def test_precheck_unit_unconstrained_when_context_has_no_durations():
+    """能力不可解析（ctx.supported_durations 为空）时原样透传，沿用现状放行不弹确认。"""
+    ctx = ProjectDurationContext(supported_durations=(), resolution=None, provider_id="", model_name=None)
+    unit = {"duration_seconds": 7, "references": []}
+    slot = precheck_unit(ctx, unit, None)
+    assert slot.seconds == 7
+    assert slot.adjustment == "unconstrained"
+    assert slot.needs_confirmation is False
 
 
 @pytest.mark.unit
@@ -1025,6 +1127,116 @@ async def test_execute_reference_video_task_rounds_up_non_member_duration(
     warnings = result["warnings"]
     assert [w["key"] for w in warnings] == ["ref_duration_rounded_up"]
     assert warnings[0]["params"] == {"total": 5, "duration": 8, "model": "sora-2"}
+
+
+async def test_execute_reference_video_task_persists_effective_duration_when_rounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """取档偏移剧本编排（adjustment != exact）时，effective_duration 写回 task payload，
+    供 resume 路径（``server.services.resume_executor``）读到与本次实际申请一致的秒数。
+    """
+    proj_dir = _write_project(tmp_path)
+    script_path = proj_dir / "scripts" / "episode_1.json"
+    script = json.loads(script_path.read_text(encoding="utf-8"))
+    script["video_units"][0]["shots"] = [{"duration": 5, "text": "Shot 1 (5s): @张三 推门"}]
+    script["video_units"][0]["duration_seconds"] = 5
+    script_path.write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
+
+    from server.services import reference_video_tasks as rvt
+
+    fake_pm = MagicMock()
+    fake_pm.load_project.return_value = json.loads((proj_dir / "project.json").read_text(encoding="utf-8"))
+    fake_pm.get_project_path.return_value = proj_dir
+    fake_pm.load_script.side_effect = lambda *_a: json.loads(script_path.read_text(encoding="utf-8"))
+    _wire_locked_script(fake_pm)
+    monkeypatch.setattr(rvt, "get_project_manager", lambda: fake_pm)
+
+    async def _fake_generate_video_async(**kwargs):
+        out = proj_dir / "reference_videos" / "E1U1.mp4"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"\x00")
+        return out, 1, None, None
+
+    fake_generator = MagicMock()
+    fake_generator.generate_video_async = AsyncMock(side_effect=_fake_generate_video_async)
+    _wire_context(
+        monkeypatch,
+        rvt,
+        fake_generator,
+        backend_name="openai",
+        backend_model="sora-2",
+        max_refs=9,
+        max_duration=12,
+        supported_durations=(4, 8, 12),
+    )
+
+    fake_queue = MagicMock()
+    fake_queue.persist_effective_duration = AsyncMock()
+    monkeypatch.setattr(rvt, "get_generation_queue", lambda: fake_queue)
+
+    await rvt.execute_reference_video_task(
+        "demo",
+        "E1U1",
+        {"script_file": "scripts/episode_1.json"},
+        user_id="u1",
+        task_id="task-1",
+    )
+
+    fake_queue.persist_effective_duration.assert_awaited_once_with("task-1", 8)
+
+
+async def test_execute_reference_video_task_persists_duration_when_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """未偏移（adjustment == exact）时同样要写回：入队 payload 从不携带 duration_seconds，
+    不写回会让 resume 回退到 project.default_duration 而非该 unit 自己的时长。"""
+    proj_dir = _write_project(tmp_path)
+
+    from server.services import reference_video_tasks as rvt
+
+    fake_pm = MagicMock()
+    fake_pm.load_project.return_value = json.loads((proj_dir / "project.json").read_text(encoding="utf-8"))
+    fake_pm.get_project_path.return_value = proj_dir
+    fake_pm.load_script.side_effect = lambda *_a: json.loads(
+        (proj_dir / "scripts" / "episode_1.json").read_text(encoding="utf-8")
+    )
+    _wire_locked_script(fake_pm)
+    monkeypatch.setattr(rvt, "get_project_manager", lambda: fake_pm)
+
+    async def _fake_generate_video_async(**kwargs):
+        out = proj_dir / "reference_videos" / "E1U1.mp4"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"\x00")
+        return out, 1, None, None
+
+    fake_generator = MagicMock()
+    fake_generator.generate_video_async = AsyncMock(side_effect=_fake_generate_video_async)
+    _wire_context(
+        monkeypatch,
+        rvt,
+        fake_generator,
+        backend_name="openai",
+        backend_model="sora-2",
+        max_refs=9,
+        max_duration=12,
+        supported_durations=(3, 8, 12),
+    )
+
+    fake_queue = MagicMock()
+    fake_queue.persist_effective_duration = AsyncMock()
+    monkeypatch.setattr(rvt, "get_generation_queue", lambda: fake_queue)
+
+    await rvt.execute_reference_video_task(
+        "demo",
+        "E1U1",
+        {"script_file": "scripts/episode_1.json"},
+        user_id="u1",
+        task_id="task-1",
+    )
+
+    fake_queue.persist_effective_duration.assert_awaited_once_with("task-1", 3)
 
 
 def test_apply_unit_video_assets_distinguishes_failures():
