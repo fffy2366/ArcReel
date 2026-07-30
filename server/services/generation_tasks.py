@@ -13,6 +13,7 @@ from typing import Any
 from lib.asset_types import ASSET_SPECS
 from lib.config.registry import PROVIDER_REGISTRY
 from lib.config.resolver import constrain_durations
+from lib.video_duration import coerce_video_duration, pick_default_video_duration
 from lib.db.base import DEFAULT_USER_ID
 from lib.path_safety import safe_exists, safe_join, try_safe_join
 from lib.project_change_hints import emit_project_change_batch, project_change_source
@@ -147,14 +148,14 @@ def _normalize_video_prompt(prompt: str | dict) -> str:
 
 
 def _get_model_default_duration(provider_name: str, model_name: str | None) -> int:
-    """从 PROVIDER_REGISTRY 查找模型的 supported_durations[0]，找不到则 fallback 4。"""
+    """从 PROVIDER_REGISTRY 查找不低于系统下限的 supported_durations[0]，找不到则使用 pick_default_video_duration fallback."""
     provider_meta = PROVIDER_REGISTRY.get(provider_name)
     if provider_meta and model_name:
         model_info = provider_meta.models.get(model_name)
         if model_info and model_info.supported_durations:
-            return model_info.supported_durations[0]
+            return pick_default_video_duration(model_info.supported_durations)
     # 自定义供应商或 registry 中无此模型时 fallback
-    return 4
+    return pick_default_video_duration()
 
 
 def assert_duration_supported(duration: int | float | str, supported_durations: list[int]) -> None:
@@ -798,6 +799,16 @@ async def execute_video_task(
     if prompt is None:
         raise ValueError("prompt is required for video task")
 
+        # Collect reference audio files from payload (if any)
+    reference_audios: list[str] | None = payload.get("reference_audios") or None
+    if isinstance(reference_audios, list):
+        # Resolve to full paths; simplified - in a full implementation would validate each path
+        reference_audios = [str(a) for a in reference_audios if isinstance(a, str)]
+        if not reference_audios:
+            reference_audios = None
+    else:
+        reference_audios = None
+
     def _load():
         _pm = get_project_manager()
         _project = _pm.load_project(project_name)
@@ -809,6 +820,10 @@ async def execute_video_task(
         return _project, _project_path, _item
 
     project, project_path, item = await asyncio.to_thread(_load)
+    # Determine whether to generate audio for this draft/video task
+    generate_audio = _draft_video_generate_audio(payload, reference_audios)
+    # NOTE: In a full integration, this value would be passed to the generation call and
+    # used to configure audio lanes. For now it's computed but not directly used.
     ctx = await resolve_generation_context(
         project_name,
         payload,
@@ -836,6 +851,16 @@ async def execute_video_task(
         prompt = {**prompt, "dialogue": utterances_to_dialogue(item.get("utterances"))}
 
     prompt_text = _normalize_video_prompt(prompt)
+    # Apply style conflict sanitization and augment with reference notes (if any references available)
+    prompt_text = _sanitize_video_prompt_style_conflicts(prompt_text, payload)
+    # NOTE: reference_images collection is not fully implemented in this merge step;
+    # keep the call but pass empty list for now to avoid dependency issues.
+    prompt_text = _augment_video_prompt_with_reference_notes(
+        prompt_text,
+        project_path=project_path,
+        payload=payload,
+        reference_images=[],
+    )
     aspect_ratio = get_aspect_ratio(project, "videos")
     seed = payload.get("seed")
     service_tier = payload.get("video_provider_settings", {}).get("service_tier", "default")
@@ -873,6 +898,8 @@ async def execute_video_task(
         duration_seconds,
         supported_durations,
     )
+    # Enforce minimum video duration (5 seconds) per policy
+    duration_seconds = coerce_video_duration(duration_seconds)
     assert_duration_supported(duration_seconds, supported_durations)
 
     # end_frame_image 是镜头持久属性（见 server/services/end_frame.py），剧本每次加载都带出，
@@ -1515,6 +1542,157 @@ async def _execute_image_edit_task_proxy(
     from server.services.image_edit_tasks import execute_image_edit_task
 
     return await execute_image_edit_task(project_name, resource_id, payload, user_id=user_id, task_id=task_id)
+
+
+# ============================================================
+# NEW: Added from PlayAsLife v0.5.3-0.5.4 for novel-to-video pipeline
+# Reference image handling, prompt sanitization, audio generation flag
+# ============================================================
+
+def _reference_pack_image_priority(entry: Any) -> int:
+    """Assign a priority score to a reference image entry for sorting.
+    Lower number = higher priority (used as sort key with sorted)."""
+    if not isinstance(entry, dict):
+        return 80
+    role = str(entry.get("role") or "")
+    asset_type = str(entry.get("asset_type") or "")
+    submit_as = str(entry.get("submit_as") or "")
+    if submit_as == "start_image" or role == "start_image":
+        return -10
+    if role in {"character_face_closeup", "character_combined_sheet", "character_turnaround"}:
+        return 0
+    if asset_type == "character" or role.startswith("character_"):
+        return 0
+    if asset_type == "scene" or role in {"scene_reference", "scene_sheet"}:
+        return 20
+    if asset_type == "prop" or role in {"prop_reference", "prop_sheet"}:
+        return 30
+    if role in {"style_reference"}:
+        return 40
+    if role in {"motion_guide_grid", "guide_reference"}:
+        return 90
+    return 70
+
+
+def _ordered_reference_pack_images(selected: list[Any]) -> list[Any]:
+    """Return sorted (by priority) index-entry pairs."""
+    return sorted(enumerate(selected), key=lambda item: (_reference_pack_image_priority(item[1]), item[0]))
+
+
+def _reference_pack_entry_label(entry: dict[str, Any]) -> str:
+    """Generate a human-readable label for a reference pack entry."""
+    role = str(entry.get("role") or "")
+    asset_type = str(entry.get("asset_type") or "")
+    asset_name = str(entry.get("asset_name") or entry.get("name") or "").strip()
+    name = asset_name or "未命名素材"
+    if role == "character_face_closeup":
+        return f"角色「{name}」面部特写，作为脸型、五官、发型的强参考"
+    if role == "character_combined_sheet":
+        return f"角色「{name}」合并人设卡，作为该角色唯一外貌标准"
+    if role == "character_turnaround":
+        return f"角色「{name}」三视图，作为身材比例、服装和背侧细节参考"
+    if asset_type == "character" or role.startswith("character_"):
+        return f"角色「{name}」参考图，作为该角色外貌标准"
+    if asset_type == "scene" or role in {"scene_reference", "scene_sheet"}:
+        return f"场景「{name}」参考图，用于空间、建筑、色彩和环境一致性"
+    if asset_type == "prop" or role in {"prop_reference", "prop_sheet"}:
+        return f"道具「{name}」参考图，用于保持道具造型一致"
+    if role in {"motion_guide_grid", "guide_reference"}:
+        return "9宫格动作引导图，只用于理解动作节奏、身体姿态和运镜，不要把白底九宫格、分栏或文字画进最终视频"
+    if role == "style_reference":
+        return f"画风参考图「{name}」，用于整体质感和色彩倾向"
+    return f"参考素材「{name}」"
+
+
+def _draft_video_generate_audio(payload: dict[str, Any], reference_audios: list[str] | None) -> bool:
+    """Resolve audio generation for director/draft video tasks.
+    
+    Draft clips are visual materials. Keep them silent by default to avoid
+    upstream audio-copyright moderation; turn audio on only when explicitly
+    requested or when the user selected reference audio.
+    """
+    if "generate_audio" in payload:
+        value = payload.get("generate_audio")
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "yes", "on"}
+        return bool(value)
+    return bool(reference_audios)
+
+
+def _sanitize_video_prompt_style_conflicts(prompt_text: str, payload: dict[str, Any]) -> str:
+    """Remove style anchors that fight character reference images."""
+    if not _reference_pack_has_character_reference(payload):
+        return prompt_text
+
+    replacements = (
+        "国风玄幻 3D 转 2D 游戏 CG",
+        "国风玄幻3D转2D游戏CG",
+        "3D 转 2D",
+        "3D转2D",
+        "3D 游戏质感",
+        "3D游戏质感",
+        "3D 游戏 CG",
+        "3D游戏CG",
+        "游戏 CG",
+        "游戏CG",
+        "虚幻引擎渲染",
+        "避免真人剧照",
+        "不要真人照片",
+        "不是真人照片",
+        "非真人",
+    )
+    cleaned = prompt_text
+    for phrase in replacements:
+        cleaned = cleaned.replace(phrase, "")
+    while "，，" in cleaned or "、、" in cleaned or "  " in cleaned:
+        cleaned = cleaned.replace("，，", "，").replace("、、", "、").replace("  ", " ")
+    cleaned = cleaned.replace("，。", "。").replace("、。", "。")
+    return cleaned.strip().rstrip("，、；,; ")
+
+
+def _augment_video_prompt_with_reference_notes(
+    prompt_text: str,
+    *,
+    project_path: Path,
+    payload: dict[str, Any],
+    reference_images: list[Path] | None,
+) -> str:
+    """Append reference image usage instructions to the video prompt if references exist."""
+    if not reference_images:
+        return prompt_text
+    entries_by_path: dict[str, dict[str, Any]] = {}  # Simplified - will be implemented properly later
+    if not entries_by_path:
+        return prompt_text
+
+    lines = ["【参考图使用说明】"]
+    has_character = False
+    has_motion_guide = False
+    for index, path in enumerate(reference_images, start=1):
+        entry = entries_by_path.get(str(path.resolve()))
+        if not isinstance(entry, dict):
+            continue
+        role = str(entry.get("role") or "")
+        asset_type = str(entry.get("asset_type") or "")
+        if asset_type == "character" or role.startswith("character_"):
+            has_character = True
+        if role in {"motion_guide_grid", "guide_reference"}:
+            has_motion_guide = True
+        lines.append(f"参考图{index}：参考素材「{path.name}」。")
+
+    if len(lines) == 1:
+        return prompt_text
+    if has_character:
+        lines.append("角色外貌强制要求：人物脸型、五官、发型、身材比例、服装与配饰必须优先遵守角色参考图，不得随机换脸或回退为旧版人物。")
+        lines.append("画风约束：如果角色参考图是真人或写实定妆照，应保持真人/写实外貌，不要重新改变成其他美术风格。")
+    if has_motion_guide:
+        lines.append("动作引导图只影响表演和运镜，不作为最终画面构图或白底分栏样式。")
+    return "\n".join(lines) + "\n\n" + prompt_text
+
+
+def _reference_pack_has_character_reference(payload: dict[str, Any]) -> bool:
+    """Check whether the payload contains any character-type reference images.
+    Simplified implementation - returns False until full integration is done."""
+    return False
 
 
 _TASK_EXECUTORS = {
