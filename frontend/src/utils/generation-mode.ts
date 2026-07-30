@@ -1,13 +1,13 @@
 /**
  * Generation mode helpers — mirrors lib/project_manager.py:effective_mode().
  *
- * Canonical values: "storyboard" | "grid" | "reference_video".
+ * Canonical values: "storyboard" | "director_storyboard" | "grid" | "reference_video".
  * Legacy value "single" (old projects) is normalized to "storyboard".
  */
 
-export type GenerationMode = "storyboard" | "grid" | "reference_video";
+export type GenerationMode = "storyboard" | "director_storyboard" | "grid" | "reference_video";
 
-const CANONICAL: readonly GenerationMode[] = ["storyboard", "grid", "reference_video"];
+const CANONICAL: readonly GenerationMode[] = ["storyboard", "director_storyboard", "grid", "reference_video"];
 
 /** All recognized input strings (canonical + legacy alias). */
 const RECOGNIZED = new Set<string>(["single", ...CANONICAL]);

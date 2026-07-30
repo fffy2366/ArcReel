@@ -6,7 +6,7 @@ describe("normalizeMode", () => {
     expect(normalizeMode("single")).toBe("storyboard");
   });
   it("keeps canonical values", () => {
-    for (const m of ["storyboard", "grid", "reference_video"] as GenerationMode[]) {
+    for (const m of ["storyboard", "director_storyboard", "grid", "reference_video"] as GenerationMode[]) {
       expect(normalizeMode(m)).toBe(m);
     }
   });
