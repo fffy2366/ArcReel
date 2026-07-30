@@ -123,6 +123,10 @@ class TextTaskType(StrEnum):
     SCRIPT = "script"
     OVERVIEW = "overview"
     STYLE_ANALYSIS = "style"
+    STORY_BEATS = "story_beats"
+    DIRECTOR_SHOTS = "director_shots"
+    KEYFRAME_PROMPTS = "keyframe_prompts"
+    VIDEO_PROMPTS = "video_prompts"
 
 
 class TextTaskTier(StrEnum):
@@ -142,6 +146,10 @@ TEXT_TASK_TIERS: dict[TextTaskType, TextTaskTier] = {
     TextTaskType.SCRIPT: TextTaskTier.COMPLEX,
     TextTaskType.OVERVIEW: TextTaskTier.SIMPLE,
     TextTaskType.STYLE_ANALYSIS: TextTaskTier.SIMPLE,
+    TextTaskType.STORY_BEATS: TextTaskTier.COMPLEX,
+    TextTaskType.DIRECTOR_SHOTS: TextTaskTier.COMPLEX,
+    TextTaskType.KEYFRAME_PROMPTS: TextTaskTier.COMPLEX,
+    TextTaskType.VIDEO_PROMPTS: TextTaskTier.COMPLEX,
 }
 
 if _missing := set(TextTaskType) - set(TEXT_TASK_TIERS):
