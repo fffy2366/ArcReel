@@ -1,12 +1,11 @@
+from __future__ import annotations
+
 """Stage-1 story import analysis helpers.
 
 This is a deterministic first-pass analyzer. It creates the product data
 contract for "导入小说 / 剧本" before we wire in an LLM/skill runner.
 """
 
-from __future__ import annotations
-
-import json
 import logging
 import re
 from collections import Counter
@@ -29,6 +28,7 @@ from server.services.project_type_templates import (
     interactive_kind_for_text,
     template_summary,
 )
+from server.services.text_model_json import parse_model_json_object
 
 logger = logging.getLogger(__name__)
 
@@ -792,17 +792,7 @@ def _parse_llm_analysis_text(
     source_text: str,
     project: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    raw = text.strip()
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start < 0 or end <= start:
-            raise
-        payload = json.loads(raw[start : end + 1])
-    if not isinstance(payload, dict):
-        raise ValueError("story analysis LLM response must be a JSON object")
+    payload = parse_model_json_object(text)
     payload.setdefault("schema_version", 1)
     payload["episode"] = episode
     payload.setdefault("source_filename", source_filename)

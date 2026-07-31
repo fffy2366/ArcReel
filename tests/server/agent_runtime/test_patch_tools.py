@@ -836,6 +836,20 @@ class TestPatchProjectSettings:
         assert out.get("is_error") is True
         assert "source_language" not in ctx.pm.load_project("demo")
 
+    async def test_set_and_clear_project_type(self, ctx: ToolContext) -> None:
+        out = await _call(patch_project_tool(ctx), {"settings": {"project_type": "narrated_drama"}})
+        assert out.get("is_error") is not True
+        assert ctx.pm.load_project("demo")["project_type"] == "narrated_drama"
+
+        out = await _call(patch_project_tool(ctx), {"settings": {"project_type": None}})
+        assert out.get("is_error") is not True
+        assert "project_type" not in ctx.pm.load_project("demo")
+
+    async def test_invalid_project_type_rejected(self, ctx: ToolContext) -> None:
+        out = await _call(patch_project_tool(ctx), {"settings": {"project_type": "unknown"}})
+        assert out.get("is_error") is True
+        assert "project_type" not in ctx.pm.load_project("demo")
+
     @pytest.mark.parametrize("bad_value", [0, -5, 1.5, True, "10.5", "10.0", "abc", ""])
     async def test_invalid_value_rejected(self, ctx: ToolContext, bad_value: Any) -> None:
         out = await _call(patch_project_tool(ctx), {"settings": {"episode_target_units": bad_value}})

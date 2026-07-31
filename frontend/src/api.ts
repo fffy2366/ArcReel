@@ -57,6 +57,14 @@ import type {
   NarrationStep1Draft,
   ReferenceStep1Draft,
   VideoCapabilities,
+  StoryBeatPlan,
+  DirectorShotPlan,
+  DraftVideoQaPlan,
+  DraftVideoStatus,
+  KeyframeImageStatus,
+  KeyframePromptPlan,
+  StoryImportAnalysis,
+  VideoPromptPlan,
 } from "@/types";
 import type { GenerationMode } from "@/utils/generation-mode";
 import type { GridGeneration } from "@/types/grid";
@@ -145,6 +153,14 @@ export interface VersionInfo {
   source?: string;
 }
 
+/** Draft metadata returned by listDrafts. */
+export interface DraftInfo {
+  episode: number;
+  step: number;
+  filename: string;
+  modified_at: string;
+}
+
 /** 镜头/单元媒体上传的统一响应。 */
 export interface ShotUploadResult {
   success: boolean;
@@ -214,6 +230,7 @@ export interface CreateProjectPayload {
   title: string;
   name?: string;
   content_mode?: "narration" | "drama" | "ad";
+  project_type?: string | null;
   /** 源文件性质：novel（默认）/ screenplay。仅 drama 暴露，创建即定、不可变。 */
   source_kind?: "novel" | "screenplay";
   aspect_ratio?: "9:16" | "16:9";
@@ -389,6 +406,13 @@ function withAuthQuery(url: string): string {
   if (!token) return url;
   const sep = url.includes("?") ? "&" : "?";
   return `${url}${sep}token=${encodeURIComponent(token)}`;
+}
+
+function encodePathSegments(path: string): string {
+  return path
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
 }
 
 class API {
@@ -1108,12 +1132,12 @@ class API {
     if (path.startsWith("data:")) {
       return path;
     }
-    const base = `${API_BASE}/files/${encodeURIComponent(projectName)}/${path}`;
+    const base = `${API_BASE}/files/${encodeURIComponent(projectName)}/${encodePathSegments(path)}`;
     if (cacheBust == null || cacheBust === "") {
-      return base;
+      return withAuthQuery(base);
     }
 
-    return `${base}?v=${encodeURIComponent(String(cacheBust))}`;
+    return withAuthQuery(`${base}?v=${encodeURIComponent(String(cacheBust))}`);
   }
 
   // ==================== Source 文件管理 ====================
@@ -1176,6 +1200,17 @@ class API {
   // ==================== 草稿文件管理 ====================
 
   /**
+   * 获取项目的所有草稿
+   */
+  static async listDrafts(
+    projectName: string
+  ): Promise<{ drafts: DraftInfo[] }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/drafts`
+    );
+  }
+
+  /**
    * 获取草稿内容
    */
   static async getDraftContent(
@@ -1212,6 +1247,307 @@ class API {
     );
     await throwIfNotOk(response, "保存草稿失败");
     return response.json() as Promise<SuccessResponse>;
+  }
+
+  static async getStoryAnalysis(
+    projectName: string,
+    episode: number
+  ): Promise<StoryImportAnalysis | null> {
+    const url = `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/analysis`;
+    const response = await fetch(`${API_BASE}${url}`, withAuth(url));
+    if (response.status === 404) return null;
+    await throwIfNotOk(response, "获取导入分析失败");
+    return response.json() as Promise<StoryImportAnalysis>;
+  }
+
+  static async generateStoryAnalysis(
+    projectName: string,
+    episode: number,
+    options: { sourceFilename?: string; engine?: "agent" | "auto" | "llm" | "deterministic" } = {}
+  ): Promise<StoryImportAnalysis> {
+    const payload: { source_filename: string | null; engine?: "agent" | "auto" | "llm" | "deterministic" } = {
+      source_filename: options.sourceFilename ?? null,
+    };
+    if (options.engine) payload.engine = options.engine;
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/analysis/generate`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  static async updateStoryAnalysis(
+    projectName: string,
+    episode: number,
+    analysis: StoryImportAnalysis
+  ): Promise<StoryImportAnalysis> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/analysis`,
+      {
+        method: "PUT",
+        body: JSON.stringify(analysis),
+      }
+    );
+  }
+
+  static async getStoryBeats(
+    projectName: string,
+    episode: number
+  ): Promise<StoryBeatPlan | null> {
+    const url = `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/story-beats`;
+    const response = await fetch(`${API_BASE}${url}`, withAuth(url));
+    if (response.status === 404) return null;
+    await throwIfNotOk(response, "获取剧情节拍失败");
+    return response.json() as Promise<StoryBeatPlan>;
+  }
+
+  static async generateStoryBeats(
+    projectName: string,
+    episode: number
+  ): Promise<StoryBeatPlan> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/story-beats/generate`,
+      { method: "POST" }
+    );
+  }
+
+  static async getDirectorShots(
+    projectName: string,
+    episode: number
+  ): Promise<DirectorShotPlan | null> {
+    const url = `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/director-shots`;
+    const response = await fetch(`${API_BASE}${url}`, withAuth(url));
+    if (response.status === 404) return null;
+    await throwIfNotOk(response, "获取导演分镜失败");
+    return response.json() as Promise<DirectorShotPlan>;
+  }
+
+  static async generateDirectorShots(
+    projectName: string,
+    episode: number
+  ): Promise<DirectorShotPlan> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/director-shots/generate`,
+      { method: "POST" }
+    );
+  }
+
+  static async getKeyframePrompts(
+    projectName: string,
+    episode: number
+  ): Promise<KeyframePromptPlan | null> {
+    const url = `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/keyframe-prompts`;
+    const response = await fetch(`${API_BASE}${url}`, withAuth(url));
+    if (response.status === 404) return null;
+    await throwIfNotOk(response, "获取关键帧提示词失败");
+    return response.json() as Promise<KeyframePromptPlan>;
+  }
+
+  static async generateKeyframePrompts(
+    projectName: string,
+    episode: number
+  ): Promise<KeyframePromptPlan> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/keyframe-prompts/generate`,
+      { method: "POST" }
+    );
+  }
+
+  static async updateKeyframePrompts(
+    projectName: string,
+    episode: number,
+    payload: KeyframePromptPlan
+  ): Promise<KeyframePromptPlan> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/keyframe-prompts`,
+      {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  static async getKeyframes(
+    projectName: string,
+    episode: number
+  ): Promise<KeyframeImageStatus | null> {
+    const url = `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/keyframes`;
+    const response = await fetch(`${API_BASE}${url}`, withAuth(url));
+    if (response.status === 404) return null;
+    await throwIfNotOk(response, "获取关键帧状态失败");
+    return response.json() as Promise<KeyframeImageStatus>;
+  }
+
+  static async generateKeyframe(
+    projectName: string,
+    keyframeId: string,
+    payload: {
+      prompt: string;
+      negative_prompt?: string | null;
+      episode: number;
+      shot_id?: string | null;
+      role?: string;
+      reference_images?: string[];
+    }
+  ): Promise<{ success: boolean; task_id: string; deduped?: boolean; message: string }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/generate/keyframe/${encodeURIComponent(keyframeId)}`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  static async getVideoPrompts(
+    projectName: string,
+    episode: number
+  ): Promise<VideoPromptPlan | null> {
+    const url = `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/video-prompts`;
+    const response = await fetch(`${API_BASE}${url}`, withAuth(url));
+    if (response.status === 404) return null;
+    await throwIfNotOk(response, "获取视频提示词包失败");
+    return response.json() as Promise<VideoPromptPlan>;
+  }
+
+  static async generateVideoPrompts(
+    projectName: string,
+    episode: number
+  ): Promise<VideoPromptPlan> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/video-prompts/generate`,
+      { method: "POST" }
+    );
+  }
+
+  static async optimizeVideoPrompt(
+    projectName: string,
+    episode: number,
+    payload: {
+      prompt: string;
+      video_id?: string | null;
+      shot_id?: string | null;
+      title?: string | null;
+      duration_seconds?: number | null;
+      reference_pack?: unknown;
+    }
+  ): Promise<{
+    original_prompt: string;
+    optimized_prompt: string;
+    char_count: number;
+    within_limit: boolean;
+    max_chars: number;
+    provider: string;
+    model: string;
+  }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/video-prompts/optimize`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  static async updateVideoPrompts(
+    projectName: string,
+    episode: number,
+    payload: VideoPromptPlan
+  ): Promise<VideoPromptPlan> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/video-prompts`,
+      {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  static async getDraftVideos(
+    projectName: string,
+    episode: number
+  ): Promise<DraftVideoStatus | null> {
+    const url = `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/draft-videos`;
+    const response = await fetch(`${API_BASE}${url}`, withAuth(url));
+    if (response.status === 404) return null;
+    await throwIfNotOk(response, "获取草稿视频状态失败");
+    return response.json() as Promise<DraftVideoStatus>;
+  }
+
+  static async generateDraftVideo(
+    projectName: string,
+    videoId: string,
+    payload: {
+      prompt: string;
+      episode: number;
+      duration_seconds?: number | null;
+      start_image?: string | null;
+      reference_pack?: unknown;
+      reference_images?: string[] | null;
+      reference_videos?: string[] | null;
+      reference_audios?: string[] | null;
+      seed?: number | null;
+    }
+  ): Promise<{ success: boolean; task_id: string; deduped?: boolean; message: string }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/generate/draft-video/${encodeURIComponent(videoId)}`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  static async repairDraftVideo(
+    projectName: string,
+    videoId: string,
+    payload: { episode: number; seed?: number | null }
+  ): Promise<{ success: boolean; task_id: string; deduped?: boolean; message: string }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/generate/draft-video/${encodeURIComponent(videoId)}/repair`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  static async getDraftVideoQa(
+    projectName: string,
+    episode: number
+  ): Promise<DraftVideoQaPlan | null> {
+    const url = `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/draft-video-qa`;
+    const response = await fetch(`${API_BASE}${url}`, withAuth(url));
+    if (response.status === 404) return null;
+    await throwIfNotOk(response, "获取草稿视频质检失败");
+    return response.json() as Promise<DraftVideoQaPlan>;
+  }
+
+  static async generateDraftVideoQa(
+    projectName: string,
+    episode: number
+  ): Promise<DraftVideoQaPlan> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/draft-video-qa/generate`,
+      { method: "POST" }
+    );
+  }
+
+  static async updateDraftVideoQa(
+    projectName: string,
+    episode: number,
+    videoId: string,
+    payload: { status: string; issue_type?: string | null; note?: string }
+  ): Promise<DraftVideoQaPlan> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/drafts/${episode}/draft-video-qa/${encodeURIComponent(videoId)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(payload),
+      }
+    );
   }
 
   /**
@@ -2260,9 +2596,9 @@ class API {
     const parts = path.split("/");
     if (parts.length < 3 || parts[0] !== "_global_assets") return null;
     const type = parts[1];
-    const filename = parts.slice(2).join("/");
+    const filename = encodePathSegments(parts.slice(2).join("/"));
     const qs = fp ? `?fp=${encodeURIComponent(fp)}` : "";
-    return `${API_BASE}/global-assets/${type}/${filename}${qs}`;
+    return withAuthQuery(`${API_BASE}/global-assets/${encodeURIComponent(type)}/${filename}${qs}`);
   }
 
   // ==================== Reference-to-Video API ====================

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Video Prompt"
+  short_description: "把分镜、关键帧和参考图角色编译成可控视频生成提示词"
+  default_prompt: "根据 shot 和 keyframe 模块生成视频提示词，明确 start_image、guide_reference、end_image、review_only 和资产参考图的提交方式。"

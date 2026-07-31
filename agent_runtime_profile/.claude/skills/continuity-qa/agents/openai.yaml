@@ -1,0 +1,4 @@
+interface:
+  display_name: "Continuity QA"
+  short_description: "检查视频一致性问题并生成分层返修处方和重试建议"
+  default_prompt: "Use $continuity-qa to inspect a generated video result and produce a repair plan."

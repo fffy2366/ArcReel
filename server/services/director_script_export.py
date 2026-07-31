@@ -193,8 +193,6 @@ def build_director_storyboard_episode_script(
                     "video_clip": None,
                     "video_thumbnail": None,
                     "video_uri": None,
-                    "last_generation_inputs": None,
-                    "qa_report": None,
                     "status": "pending",
                 },
             }

@@ -5,15 +5,16 @@ Task execution service for queued generation jobs.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from lib.asset_types import ASSET_SPECS
 from lib.config.registry import PROVIDER_REGISTRY
 from lib.config.resolver import constrain_durations
-from lib.video_duration import coerce_video_duration, pick_default_video_duration
 from lib.db.base import DEFAULT_USER_ID
 from lib.path_safety import safe_exists, safe_join, try_safe_join
 from lib.project_change_hints import emit_project_change_batch, project_change_source
@@ -45,6 +46,7 @@ from lib.storyboard_sequence import (
 )
 from lib.thumbnail import extract_video_thumbnail
 from lib.video_backends.base import VideoCapabilityError
+from lib.video_duration import coerce_video_duration, pick_default_video_duration
 from server.services.generation_context import (
     AudioLaneRequest,
     ImageLaneRequest,
@@ -104,14 +106,19 @@ def _normalize_storyboard_prompt(prompt: str | dict, style: str) -> str:
     return append_image_negative_tail(image_prompt_to_yaml(normalized_prompt, style))
 
 
-def _normalize_video_prompt(prompt: str | dict) -> str:
-    """归一化视频 prompt 并在末尾追加统一文本化的反向提示词。"""
+def _normalize_video_prompt(prompt: str | dict, *, append_tail: bool = True) -> str:
+    """归一化视频 prompt。
+
+    普通分镜视频默认追加统一反向提示词；导演分镜预处理的草稿视频提示词已经是
+    可人工编辑的最终文本，调用方可关闭追加，保持"看到什么就提交什么"。
+    """
     from lib.prompt_builders import append_video_negative_tail
 
     if isinstance(prompt, str):
         if not prompt.strip():
             raise ValueError("prompt must not be empty")
-        return append_video_negative_tail(prompt)
+        text = prompt.strip()
+        return append_video_negative_tail(text) if append_tail else text
 
     if not isinstance(prompt, dict):
         raise ValueError("prompt must be a string or object")
@@ -144,7 +151,8 @@ def _normalize_video_prompt(prompt: str | dict) -> str:
         "ambiance_audio": str(prompt.get("ambiance_audio", "") or ""),
         "dialogue": normalized_dialogue,
     }
-    return append_video_negative_tail(video_prompt_to_yaml(normalized_prompt))
+    text = video_prompt_to_yaml(normalized_prompt)
+    return append_video_negative_tail(text) if append_tail else text
 
 
 def _get_model_default_duration(provider_name: str, model_name: str | None) -> int:
@@ -423,6 +431,12 @@ def compute_affected_fingerprints(project_name: str, task_type: str, resource_id
                 project_path / "thumbnails" / f"scene_{resource_id}.jpg",
             )
         )
+    elif task_type == "keyframe":
+        rel = resource_relative_path("keyframe", resource_id)
+        paths.append((rel, project_path / rel))
+    elif task_type == "draft_video":
+        rel = resource_relative_path("draft_video", resource_id)
+        paths.append((rel, project_path / rel))
     elif task_type == "character":
         paths.append(
             (
@@ -515,6 +529,8 @@ def compute_affected_fingerprints(project_name: str, task_type: str, resource_id
 _TASK_CHANGE_SPECS: dict[str, tuple] = {
     "tts": ("segment", "tts_ready", "旁白「{}」", True),
     "grid": ("grid", "grid_ready", "宫格「{}」", True),
+    "keyframe": ("keyframe", "keyframe_ready", "关键帧「{}」", False),
+    "draft_video": ("draft_video", "draft_video_ready", "视频草稿「{}」", False),
     **{atype: (atype, "updated", f"{spec.label_zh}「{{}}」设计图", False) for atype, spec in ASSET_SPECS.items()},
 }
 
@@ -820,10 +836,6 @@ async def execute_video_task(
         return _project, _project_path, _item
 
     project, project_path, item = await asyncio.to_thread(_load)
-    # Determine whether to generate audio for this draft/video task
-    generate_audio = _draft_video_generate_audio(payload, reference_audios)
-    # NOTE: In a full integration, this value would be passed to the generation call and
-    # used to configure audio lanes. For now it's computed but not directly used.
     ctx = await resolve_generation_context(
         project_name,
         payload,
@@ -1027,6 +1039,133 @@ async def _finalize_video_task(
         "resource_type": "videos",
         "resource_id": resource_id,
         "video_uri": video_uri,
+    }
+
+
+def _normalize_keyframe_prompt(
+    prompt: str,
+    style: str = "",
+    style_description: str = "",
+    negative_prompt: str = "",
+) -> str:
+    text = str(prompt or "").strip()
+    if not text:
+        raise ValueError("prompt is required for keyframe task")
+    negative_text = str(negative_prompt or "").strip()
+    if negative_text:
+        text = f"{text}\n\n负面约束：{negative_text}"
+    style_text = "；".join(part for part in (str(style or "").strip(), str(style_description or "").strip()) if part)
+    if style_text:
+        return f"{text}\n\n项目画风：{style_text}"
+    return text
+
+
+def _resolve_project_media_path(project_path: Path, raw_path: Any, *, field_name: str) -> Path:
+    raw_text = str(raw_path or "").strip()
+    if not raw_text:
+        raise ValueError(f"{field_name} is empty")
+
+    candidate = Path(raw_text)
+    if not candidate.is_absolute():
+        if candidate.parts and candidate.parts[0] == "_global_assets":
+            candidate = project_path.parent / candidate
+        else:
+            candidate = project_path / candidate
+
+    project_root = project_path.resolve()
+    resolved = candidate.resolve()
+    with contextlib.suppress(ValueError):
+        resolved.relative_to(project_root)
+        return resolved
+
+    global_assets_root = (project_path.parent / "_global_assets").resolve()
+    with contextlib.suppress(ValueError):
+        resolved.relative_to(global_assets_root)
+        return resolved
+
+    raise ValueError(f"{field_name} must be inside project or global assets")
+
+
+def _collect_keyframe_reference_images(project_path: Path, raw_images: Any) -> list[Path] | None:
+    if raw_images is None:
+        return None
+    if not isinstance(raw_images, list):
+        raise ValueError("reference_images must be an array")
+
+    refs: list[Path] = []
+    seen: set[str] = set()
+    for raw in raw_images:
+        if not str(raw or "").strip():
+            continue
+        path = _resolve_project_media_path(project_path, raw, field_name="reference_images")
+        if not path.exists():
+            raise ValueError(f"reference_image not found: {path.name}")
+        key = path.resolve().as_posix()
+        if key in seen:
+            continue
+        refs.append(path)
+        seen.add(key)
+    return refs or None
+
+
+async def execute_keyframe_task(
+    project_name: str,
+    resource_id: str,
+    payload: dict[str, Any],
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    def _prepare():
+        _project = get_project_manager().load_project(project_name)
+        _project_path = get_project_manager().get_project_path(project_name)
+        _prompt_text = _normalize_keyframe_prompt(
+            str(payload.get("prompt") or ""),
+            str(_project.get("style") or ""),
+            str(_project.get("style_description") or ""),
+            str(payload.get("negative_prompt") or ""),
+        )
+        _reference_images = _collect_keyframe_reference_images(_project_path, payload.get("reference_images"))
+        return _project, _prompt_text, _reference_images
+
+    project, prompt_text, reference_images = await asyncio.to_thread(_prepare)
+    needs_i2i = bool(reference_images)
+
+    ctx = await resolve_generation_context(
+        project_name,
+        payload,
+        project=project,
+        user_id=user_id,
+        image=ImageLaneRequest(capability="i2i" if needs_i2i else "t2i"),
+    )
+    generator = ctx.generator
+    aspect_ratio = get_aspect_ratio(project, "storyboards")
+
+    _, version = await generator.generate_image_async(
+        prompt=prompt_text,
+        resource_type="keyframes",
+        resource_id=resource_id,
+        reference_images=reference_images,
+        aspect_ratio=aspect_ratio,
+        image_size=ctx.image.resolution,
+        episode=payload.get("episode"),
+        shot_id=payload.get("shot_id"),
+        role=payload.get("role") or "start_image",
+    )
+
+    keyframe_rel = resource_relative_path("keyframe", resource_id)
+    created_at = await asyncio.to_thread(
+        lambda: generator.versions.get_versions("keyframes", resource_id)["versions"][-1]["created_at"]
+    )
+
+    return {
+        "version": version,
+        "file_path": keyframe_rel,
+        "created_at": created_at,
+        "resource_type": "keyframes",
+        "resource_id": resource_id,
+        "shot_id": payload.get("shot_id"),
+        "role": payload.get("role") or "start_image",
     }
 
 
@@ -1549,6 +1688,91 @@ async def _execute_image_edit_task_proxy(
 # Reference image handling, prompt sanitization, audio generation flag
 # ============================================================
 
+def _project_relative_media_path(project_path: Path, path: Path | None) -> str | None:
+    if path is None:
+        return None
+    resolved = path.resolve()
+    project_root = project_path.resolve()
+    with contextlib.suppress(ValueError):
+        return resolved.relative_to(project_root).as_posix()
+    global_root = (project_path.parent / "_global_assets").resolve()
+    with contextlib.suppress(ValueError):
+        return f"_global_assets/{resolved.relative_to(global_root).as_posix()}"
+    return resolved.as_posix()
+
+
+def _snapshot_duration_seconds(value: int | str | float | None) -> int | str | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _build_video_generation_inputs_snapshot(
+    *,
+    project_path: Path,
+    prompt_text: str,
+    start_image: Path | None,
+    end_image: Path | None,
+    reference_images: list[Path] | None,
+    reference_pack: Any,
+    duration_seconds: int | str | None,
+    aspect_ratio: str | None,
+    resolution: str | None,
+    provider: str | None,
+    model: str | None,
+    generate_audio: bool | None = None,
+    reference_videos: list[str] | None = None,
+    reference_audios: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "video_prompt": prompt_text,
+        "start_image": _project_relative_media_path(project_path, start_image),
+        "end_image": _project_relative_media_path(project_path, end_image),
+        "reference_images": [
+            rel
+            for rel in (_project_relative_media_path(project_path, path) for path in (reference_images or []))
+            if rel
+        ],
+        "reference_videos": reference_videos or [],
+        "reference_audios": reference_audios or [],
+        "reference_pack": reference_pack if isinstance(reference_pack, dict) else None,
+        "duration_seconds": _snapshot_duration_seconds(duration_seconds),
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
+        "provider": provider,
+        "model": model,
+        "generate_audio": generate_audio,
+    }
+
+
+def _reference_pack_selected_images(payload: dict[str, Any]) -> tuple[list[Any], bool]:
+    pack = payload.get("reference_pack")
+    if not isinstance(pack, dict):
+        return [], False
+    selected = pack.get("selected_images")
+    if not isinstance(selected, list):
+        return [], True
+    return selected, True
+
+
+def _reference_image_path_value(entry: Any) -> Any | None:
+    if isinstance(entry, str):
+        return entry
+    if not isinstance(entry, dict):
+        return None
+    for key in ("path", "file_path", "relative_path", "image_path", "asset_path"):
+        value = entry.get(key)
+        if value:
+            return value
+    image_id = entry.get("image_id")
+    if isinstance(image_id, str) and ("/" in image_id or Path(image_id).suffix):
+        return image_id
+    return None
+
+
 def _reference_pack_image_priority(entry: Any) -> int:
     """Assign a priority score to a reference image entry for sorting.
     Lower number = higher priority (used as sort key with sorted)."""
@@ -1577,6 +1801,123 @@ def _reference_pack_image_priority(entry: Any) -> int:
 def _ordered_reference_pack_images(selected: list[Any]) -> list[Any]:
     """Return sorted (by priority) index-entry pairs."""
     return sorted(enumerate(selected), key=lambda item: (_reference_pack_image_priority(item[1]), item[0]))
+
+
+def _reference_media_url_value(entry: Any, *, media_type: str) -> str | None:
+    if isinstance(entry, str):
+        return entry
+    if not isinstance(entry, dict):
+        return None
+    for key in ("url", f"{media_type}_url", "media_url", "src", "path", "file_path"):
+        value = entry.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _validate_public_media_url(raw_url: str, *, field_name: str) -> str:
+    url = raw_url.strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{field_name} must be an http(s) public URL")
+    if parsed.hostname in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
+        raise ValueError(f"{field_name} cannot be localhost; use a public URL")
+    return url
+
+
+def _collect_payload_reference_media_urls(
+    payload: dict[str, Any],
+    *,
+    top_level_key: str,
+    pack_key: str,
+    media_type: str,
+    max_count: int = 3,
+) -> tuple[list[str] | None, bool]:
+    if top_level_key in payload:
+        raw_items = payload.get(top_level_key)
+        if raw_items is None:
+            return None, True
+        if not isinstance(raw_items, list):
+            raise ValueError(f"{top_level_key} must be an array")
+        urls = [
+            _validate_public_media_url(str(raw), field_name=top_level_key)
+            for raw in raw_items
+            if str(raw or "").strip()
+        ]
+        return urls[:max_count] or None, True
+
+    pack = payload.get("reference_pack")
+    if not isinstance(pack, dict) or pack_key not in pack:
+        return None, False
+    raw_items = pack.get(pack_key)
+    if raw_items is None:
+        return None, True
+    if not isinstance(raw_items, list):
+        raise ValueError(f"reference_pack.{pack_key} must be an array")
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for entry in raw_items:
+        raw_url = _reference_media_url_value(entry, media_type=media_type)
+        if not raw_url:
+            raise ValueError(f"reference_pack {pack_key} item missing URL: {entry!r}")
+        url = _validate_public_media_url(raw_url, field_name=f"reference_pack.{pack_key}")
+        if url in seen:
+            continue
+        urls.append(url)
+        seen.add(url)
+    return urls[:max_count] or None, True
+
+
+def _collect_payload_video_reference_images(
+    project_path: Path,
+    payload: dict[str, Any],
+) -> tuple[list[Path] | None, bool]:
+    if "reference_images" in payload:
+        raw_images = payload.get("reference_images")
+        if raw_images is None:
+            return None, True
+        if not isinstance(raw_images, list):
+            raise ValueError("reference_images must be an array")
+        paths = [
+            _resolve_project_media_path(project_path, raw, field_name="reference_images")
+            for raw in raw_images
+            if str(raw or "").strip()
+        ]
+        for path in paths:
+            if not path.exists():
+                raise ValueError(f"reference_image not found: {path.name}")
+        return paths or None, True
+
+    selected, has_pack = _reference_pack_selected_images(payload)
+    if not has_pack:
+        return None, False
+
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for _original_index, entry in _ordered_reference_pack_images(selected):
+        submit_as = str(entry.get("submit_as") or "") if isinstance(entry, dict) else "reference_image"
+        role = str(entry.get("role") or "") if isinstance(entry, dict) else ""
+        if submit_as in {"start_image", "end_image", "review_only", "prompt_guidance"}:
+            continue
+        if role in {"start_image", "end_image", "review_frame"}:
+            continue
+        if submit_as and submit_as not in {"reference_image", "reference_image_or_prompt_guidance"}:
+            continue
+
+        raw_path = _reference_image_path_value(entry)
+        if not raw_path:
+            raise ValueError(f"reference_pack selected image missing path: {entry!r}")
+        path = _resolve_project_media_path(project_path, raw_path, field_name="reference_pack.selected_images")
+        if not path.exists():
+            raise ValueError(f"reference_pack image not found: {path.name}")
+        key = path.resolve().as_posix()
+        if key in seen:
+            continue
+        paths.append(path)
+        seen.add(key)
+
+    return paths or None, True
 
 
 def _reference_pack_entry_label(entry: dict[str, Any]) -> str:
@@ -1660,9 +2001,7 @@ def _augment_video_prompt_with_reference_notes(
     """Append reference image usage instructions to the video prompt if references exist."""
     if not reference_images:
         return prompt_text
-    entries_by_path: dict[str, dict[str, Any]] = {}  # Simplified - will be implemented properly later
-    if not entries_by_path:
-        return prompt_text
+    entries_by_path = _reference_pack_entries_by_resolved_path(project_path, payload)
 
     lines = ["【参考图使用说明】"]
     has_character = False
@@ -1690,14 +2029,209 @@ def _augment_video_prompt_with_reference_notes(
 
 
 def _reference_pack_has_character_reference(payload: dict[str, Any]) -> bool:
-    """Check whether the payload contains any character-type reference images.
-    Simplified implementation - returns False until full integration is done."""
+    """Check whether the payload contains any character-type reference images."""
+    selected, has_pack = _reference_pack_selected_images(payload)
+    if not has_pack:
+        return False
+    for entry in selected:
+        if not isinstance(entry, dict):
+            continue
+        role = str(entry.get("role") or "")
+        asset_type = str(entry.get("asset_type") or "")
+        submit_as = str(entry.get("submit_as") or "")
+        if submit_as in {"review_only", "prompt_guidance"}:
+            continue
+        if asset_type == "character" or role.startswith("character_"):
+            return True
     return False
+
+
+def _reference_pack_entries_by_resolved_path(project_path: Path, payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    selected, has_pack = _reference_pack_selected_images(payload)
+    if not has_pack:
+        return {}
+
+    result: dict[str, dict[str, Any]] = {}
+    for _original_index, entry in _ordered_reference_pack_images(selected):
+        if not isinstance(entry, dict):
+            continue
+        submit_as = str(entry.get("submit_as") or "")
+        role = str(entry.get("role") or "")
+        if submit_as in {"start_image", "end_image", "review_only", "prompt_guidance"}:
+            continue
+        if role in {"start_image", "end_image", "review_frame"}:
+            continue
+        if submit_as and submit_as not in {"reference_image", "reference_image_or_prompt_guidance"}:
+            continue
+        raw_path = _reference_image_path_value(entry)
+        if not raw_path:
+            continue
+        with contextlib.suppress(Exception):
+            resolved = _resolve_project_media_path(project_path, raw_path, field_name="reference_pack.selected_images")
+            result[str(resolved.resolve())] = entry
+    return result
+
+
+def _limit_video_reference_images_for_backend(reference_images: list[Path] | None, generator: Any) -> list[Path] | None:
+    if not reference_images:
+        return None
+
+    backend = getattr(generator, "_video_backend", None)
+    try:
+        caps = backend.video_capabilities if backend is not None else None
+    except Exception:
+        caps = None
+    if caps is None:
+        return reference_images
+    if not getattr(caps, "reference_images", False):
+        return None
+
+    max_refs = int(getattr(caps, "max_reference_images", 0) or 0)
+    if max_refs > 0:
+        return reference_images[:max_refs] or None
+    return reference_images
+
+
+async def execute_draft_video_task(
+    project_name: str,
+    resource_id: str,
+    payload: dict[str, Any],
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    prompt = payload.get("prompt")
+    if prompt is None:
+        raise ValueError("prompt is required for draft_video task")
+    start_image_value = payload.get("start_image")
+
+    def _load():
+        _project = get_project_manager().load_project(project_name)
+        _project_path = get_project_manager().get_project_path(project_name)
+        _start_image = None
+        if start_image_value:
+            _start_image = _resolve_project_media_path(_project_path, start_image_value, field_name="start_image")
+            if not _start_image.exists():
+                raise ValueError(f"start_image not found: {_start_image.name}")
+        _reference_images, _ = _collect_payload_video_reference_images(_project_path, payload)
+        _reference_videos, _ = _collect_payload_reference_media_urls(
+            payload,
+            top_level_key="reference_videos",
+            pack_key="selected_videos",
+            media_type="video",
+        )
+        _reference_audios, _ = _collect_payload_reference_media_urls(
+            payload,
+            top_level_key="reference_audios",
+            pack_key="selected_audios",
+            media_type="audio",
+        )
+        return _project, _project_path, _start_image, _reference_images, _reference_videos, _reference_audios
+
+    project, project_path, start_image, reference_images, reference_videos, reference_audios = await asyncio.to_thread(
+        _load
+    )
+    ctx = await resolve_generation_context(
+        project_name,
+        payload,
+        project=project,
+        user_id=user_id,
+        video=VideoLaneRequest(),
+    )
+    generator = ctx.generator
+    reference_images = _limit_video_reference_images_for_backend(reference_images, generator)
+
+    prompt_text = _normalize_video_prompt(prompt, append_tail=False)
+    prompt_text = _sanitize_video_prompt_style_conflicts(prompt_text, payload)
+    prompt_text = _augment_video_prompt_with_reference_notes(
+        prompt_text,
+        project_path=project_path,
+        payload=payload,
+        reference_images=reference_images,
+    )
+    aspect_ratio = get_aspect_ratio(project, "videos")
+    resolution = ctx.video.resolution
+    registry_provider_id = ctx.video.provider_model.provider_id
+    model_name = ctx.video.backend_model
+    supported_durations = list(ctx.video.supported_durations)
+    seed = payload.get("seed")
+    service_tier = payload.get("video_provider_settings", {}).get("service_tier", "default")
+
+    generate_audio = _draft_video_generate_audio(payload, reference_audios)
+    duration_seconds = payload.get("duration_seconds")
+    if duration_seconds is None:
+        duration_seconds = project.get("default_duration")
+    if not duration_seconds:
+        candidates = constrain_durations(registry_provider_id, model_name, supported_durations, resolution=resolution)
+        duration_seconds = candidates[0] if candidates else _get_model_default_duration(registry_provider_id, model_name)
+    duration_seconds = _normalize_manxue_1ren_duration(
+        registry_provider_id,
+        model_name,
+        duration_seconds,
+        supported_durations,
+    )
+    duration_seconds = coerce_video_duration(duration_seconds)
+    assert_duration_supported(duration_seconds, supported_durations)
+
+    generation_inputs = _build_video_generation_inputs_snapshot(
+        project_path=project_path,
+        prompt_text=prompt_text,
+        start_image=start_image,
+        end_image=None,
+        reference_images=reference_images,
+        reference_pack=payload.get("reference_pack"),
+        duration_seconds=duration_seconds,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+        provider=registry_provider_id,
+        model=model_name,
+        generate_audio=generate_audio,
+        reference_videos=reference_videos,
+        reference_audios=reference_audios,
+    )
+
+    _, version, _, video_uri = await generator.generate_video_async(
+        prompt=prompt_text,
+        resource_type="draft_videos",
+        resource_id=resource_id,
+        start_image=start_image,
+        reference_images=reference_images,
+        aspect_ratio=aspect_ratio,
+        duration_seconds=duration_seconds,
+        resolution=resolution,
+        task_id=task_id,
+        seed=seed,
+        service_tier=service_tier,
+        generate_audio=generate_audio,
+        last_generation_inputs=generation_inputs,
+        reference_videos=reference_videos or [],
+        reference_audios=reference_audios or [],
+    )
+
+    video_rel = resource_relative_path("draft_video", resource_id)
+    generation_inputs["video_clip"] = video_rel
+    if video_uri:
+        generation_inputs["video_uri"] = video_uri
+    created_at = await asyncio.to_thread(
+        lambda: generator.versions.get_versions("draft_videos", resource_id)["versions"][-1]["created_at"]
+    )
+
+    return {
+        "version": version,
+        "file_path": video_rel,
+        "created_at": created_at,
+        "resource_type": "draft_videos",
+        "resource_id": resource_id,
+        "video_uri": video_uri,
+        "generation_inputs": generation_inputs,
+    }
 
 
 _TASK_EXECUTORS = {
     "storyboard": execute_storyboard_task,
     "video": execute_video_task,
+    "keyframe": execute_keyframe_task,
+    "draft_video": execute_draft_video_task,
     "tts": execute_tts_task,
     "character": execute_character_task,
     "scene": execute_scene_task,

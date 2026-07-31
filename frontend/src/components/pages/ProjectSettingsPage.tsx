@@ -42,6 +42,26 @@ function deriveStyleValue(project: Record<string, unknown>, projectName: string)
   };
 }
 
+const PROJECT_TYPE_OPTIONS = [
+  { value: "", labelKey: "project_type_auto", descriptionKey: "project_type_auto_desc" },
+  {
+    value: "interactive_drama_game",
+    labelKey: "project_type_interactive_drama_game",
+    descriptionKey: "project_type_interactive_drama_game_desc",
+  },
+  { value: "ad", labelKey: "project_type_ad", descriptionKey: "project_type_ad_desc" },
+  {
+    value: "narrative_video",
+    labelKey: "project_type_narrative_video",
+    descriptionKey: "project_type_narrative_video_desc",
+  },
+  {
+    value: "narrated_drama",
+    labelKey: "project_type_narrated_drama",
+    descriptionKey: "project_type_narrated_drama_desc",
+  },
+] as const;
+
 // ─── Section card primitive ─────────────────────────────────────────────────
 
 interface SectionCardProps {
@@ -129,6 +149,7 @@ export function ProjectSettingsPage() {
   const [textComplex, setTextComplex] = useState<string>("");
   const [aspectRatio, setAspectRatio] = useState<string>("");
   const [generationMode, setGenerationMode] = useState<GenerationMode>("storyboard");
+  const [projectType, setProjectType] = useState<string>("");
   const [defaultDuration, setDefaultDuration] = useState<number | null>(null);
   const [videoResolution, setVideoResolution] = useState<string | null>(null);
   const [imageResolution, setImageResolution] = useState<string | null>(null);
@@ -146,7 +167,7 @@ export function ProjectSettingsPage() {
     videoBackend: "", imageBackendT2I: "", imageBackendI2I: "", audioOverride: null as boolean | null,
     audioBackend: "", narrationVoice: "", narrationSpeed: null as number | null,
     textDefault: "", textSimple: "", textComplex: "",
-    aspectRatio: "", generationMode: "storyboard",
+    aspectRatio: "", generationMode: "storyboard", projectType: "",
     defaultDuration: null as number | null,
     videoResolution: null as string | null,
     imageResolution: null as string | null,
@@ -210,6 +231,7 @@ export function ProjectSettingsPage() {
       // Mirror that here so the UI reflects the actually-effective ratio.
       const ar = rawAr || "9:16";
       const gm = normalizeMode(project.generation_mode);
+      const pt = typeof project.project_type === "string" ? project.project_type : "";
       const dd = project.default_duration != null ? (project.default_duration as number) : null;
 
       setVideoBackend(vb);
@@ -224,6 +246,7 @@ export function ProjectSettingsPage() {
       setTextComplex(tcx);
       setAspectRatio(ar);
       setGenerationMode(gm);
+      setProjectType(pt);
       setDefaultDuration(dd);
       setProjectTitle(typeof project.title === "string" ? project.title : "");
       setContentMode(typeof project.content_mode === "string" ? project.content_mode : "narration");
@@ -256,7 +279,7 @@ export function ProjectSettingsPage() {
         videoBackend: vb, imageBackendT2I: ibt2i, imageBackendI2I: ibi2i, audioOverride: ao,
         audioBackend: ab, narrationVoice: nv, narrationSpeed: ns,
         textDefault: td, textSimple: tsi, textComplex: tcx,
-        aspectRatio: ar, generationMode: gm, defaultDuration: dd,
+        aspectRatio: ar, generationMode: gm, projectType: pt, defaultDuration: dd,
         videoResolution: vRes, imageResolution: iRes,
       };
     }));
@@ -308,6 +331,7 @@ export function ProjectSettingsPage() {
     textComplex !== initialRef.current.textComplex ||
     aspectRatio !== initialRef.current.aspectRatio ||
     generationMode !== initialRef.current.generationMode ||
+    projectType !== initialRef.current.projectType ||
     defaultDuration !== initialRef.current.defaultDuration ||
     videoResolution !== initialRef.current.videoResolution ||
     imageResolution !== initialRef.current.imageResolution ||
@@ -412,6 +436,7 @@ export function ProjectSettingsPage() {
         text_backend_complex: textComplex || null,
         aspect_ratio: aspectRatio || undefined,
         generation_mode: generationMode,
+        project_type: projectType || null,
         // ad 项目禁写 default_duration（后端对字段出现本身返回 400），省略该键
         ...(contentMode === "ad" ? {} : { default_duration: defaultDuration }),
         model_settings: newModelSettings,
@@ -422,7 +447,7 @@ export function ProjectSettingsPage() {
         videoBackend, imageBackendT2I, imageBackendI2I, audioOverride,
         audioBackend, narrationVoice: trimmedVoice, narrationSpeed,
         textDefault, textSimple, textComplex,
-        aspectRatio, generationMode, defaultDuration,
+        aspectRatio, generationMode, projectType, defaultDuration,
         videoResolution, imageResolution,
       };
       useAppStore.getState().pushToast(t("saved"), "success");
@@ -431,7 +456,7 @@ export function ProjectSettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [modelSettings, videoBackend, imageBackendT2I, imageBackendI2I, audioOverride, audioBackend, narrationVoice, narrationSpeed, textDefault, textSimple, textComplex, aspectRatio, generationMode, defaultDuration, contentMode, videoResolution, imageResolution, projectName, t, globalDefaults.video, globalDefaults.imageT2I]);
+  }, [modelSettings, videoBackend, imageBackendT2I, imageBackendI2I, audioOverride, audioBackend, narrationVoice, narrationSpeed, textDefault, textSimple, textComplex, aspectRatio, generationMode, projectType, defaultDuration, contentMode, videoResolution, imageResolution, projectName, t, globalDefaults.video, globalDefaults.imageT2I]);
 
   return (
     <div
@@ -648,6 +673,33 @@ export function ProjectSettingsPage() {
                     onChange={setGenerationMode}
                     disabledModes={contentMode === "ad" ? ["grid"] : undefined}
                   />
+                </fieldset>
+              </SectionCard>
+
+              {/* Project type template */}
+              <SectionCard
+                kicker="Project Type Template"
+                title={t("project_type_template_title")}
+                description={t("project_type_template_desc")}
+              >
+                <fieldset className="grid gap-2 md:grid-cols-2">
+                  <legend className="sr-only">{t("project_type_template_title")}</legend>
+                  {PROJECT_TYPE_OPTIONS.map((option) => (
+                    <label key={option.value} className={radioCardClass(projectType === option.value)}>
+                      <input
+                        type="radio"
+                        name="projectType"
+                        value={option.value}
+                        checked={projectType === option.value}
+                        onChange={() => setProjectType(option.value)}
+                        className="sr-only"
+                      />
+                      <span className="block text-[12.5px] font-medium text-text">{t(option.labelKey)}</span>
+                      <span className="mt-0.5 block text-[11.5px] leading-[1.45] text-text-3">
+                        {t(option.descriptionKey)}
+                      </span>
+                    </label>
+                  ))}
                 </fieldset>
               </SectionCard>
 

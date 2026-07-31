@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reference Pack"
+  short_description: "为视频生成选择排序并标注最多九张参考图输入"
+  default_prompt: "Use $reference-pack to select and label image inputs for a video generation request."

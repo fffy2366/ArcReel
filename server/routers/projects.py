@@ -48,6 +48,7 @@ from server.services.project_archive import (
     ProjectArchiveValidationError,
 )
 from server.services.project_cover import resolve_project_cover
+from server.services.project_type_templates import PROJECT_TYPE_TEMPLATES
 
 router = APIRouter()
 
@@ -56,6 +57,17 @@ router = APIRouter()
 # 是读时计算值，禁止写回 project.json。title 不在白名单：它以剧本顶层 title 为唯一真相源，
 # 经 _apply_episode_sync 单向同步进 episodes[].title，专用端点 PATCH /episodes/{episode} 写入。
 EPISODE_PERSIST_FIELDS = {"script_file", "generation_mode"}
+
+
+def _validate_project_type(value: str | None) -> str | None:
+    if value is None:
+        return None
+    project_type = str(value).strip()
+    if not project_type:
+        return None
+    if project_type not in PROJECT_TYPE_TEMPLATES:
+        raise HTTPException(status_code=400, detail=f"unknown project_type: {project_type}")
+    return project_type
 
 
 def get_status_calculator() -> StatusCalculator:
@@ -81,6 +93,7 @@ class CreateProjectRequest(BaseModel):
     # 仅 content_mode=ad：创作诉求短文本（可空，不走 source_loader）
     brief: str | None = None
     generation_mode: str | None = None
+    project_type: str | None = None
     # ===== 新增 =====
     style_template_id: str | None = None
     video_backend: str | None = None
@@ -120,6 +133,7 @@ class UpdateProjectRequest(BaseModel):
     # 仅 ad 项目：创作诉求短文本；显式 null 清为空字符串
     brief: str | None = None
     generation_mode: str | None = None
+    project_type: str | None = None
     video_backend: str | None = None
     image_backend: str | None = None
     image_provider_t2i: str | None = None
@@ -495,6 +509,7 @@ async def create_project(
                     raise HTTPException(status_code=400, detail=_t("ad_only_field", field="target_duration"))
                 if req.brief is not None:
                     raise HTTPException(status_code=400, detail=_t("ad_only_field", field="brief"))
+            project_type = _validate_project_type(req.project_type)
 
             # 与 update 路径对称：校验所有 backend 字段
             for field_name in (
@@ -527,6 +542,8 @@ async def create_project(
             }
             if req.model_settings is not None:
                 extras["model_settings"] = req.model_settings
+            if project_type is not None:
+                extras["project_type"] = project_type
             # generation_mode 并入 extras 一次性写入，避免 create 后再 load-save 的额外 RMW
             if req.generation_mode is not None:
                 extras["generation_mode"] = req.generation_mode
@@ -718,6 +735,12 @@ async def update_project(name: str, req: UpdateProjectRequest, _user: CurrentUse
                         project.pop("generation_mode", None)
                     else:
                         project["generation_mode"] = req.generation_mode
+                if "project_type" in req.model_fields_set:
+                    project_type = _validate_project_type(req.project_type)
+                    if project_type is None:
+                        project.pop("project_type", None)
+                    else:
+                        project["project_type"] = project_type
                 if "default_duration" in req.model_fields_set:
                     # ad 项目对字段出现本身即拒绝（含 null）：与创建路径"禁写字段"契约一致，
                     # 避免 null 走删除分支静默返回 200

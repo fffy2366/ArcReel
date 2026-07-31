@@ -38,6 +38,10 @@ _PATTERNS: dict[str, ResourcePattern] = {
     "props": ResourcePattern("props", ".png"),
     "products": ResourcePattern("products", ".png"),
     "grids": ResourcePattern("grids", ".png"),
+    "keyframe": ResourcePattern("keyframes", ".png"),
+    "keyframes": ResourcePattern("keyframes", ".png"),
+    "draft_video": ResourcePattern("draft_videos", ".mp4"),
+    "draft_videos": ResourcePattern("draft_videos", ".mp4"),
     "reference_videos": ResourcePattern("reference_videos", ".mp4"),
     "audio": ResourcePattern("audio", ".wav", prefix="segment_"),
 }

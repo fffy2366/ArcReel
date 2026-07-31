@@ -18,6 +18,7 @@ export interface ProjectOverview {
 export interface Character {
   description: string;
   character_sheet?: string;
+  character_combined_sheet?: string;
   voice_style?: string;
   reference_image?: string;
 }
@@ -112,7 +113,7 @@ export interface EpisodeMeta {
    * Optional episode-level override; falls back to project.generation_mode.
    * Never "single" — legacy value only exists at project level.
    */
-  generation_mode?: "storyboard" | "grid" | "reference_video";
+  generation_mode?: "storyboard" | "director_storyboard" | "grid" | "reference_video";
 }
 
 export interface ModelSettingEntry {
@@ -122,6 +123,7 @@ export interface ModelSettingEntry {
 export interface ProjectData {
   title: string;
   content_mode: "narration" | "drama" | "ad";
+  project_type?: string | null;
   /** 源文件性质：novel（默认，AI 改编）/ screenplay（成品剧本，逐字提取）。创建即定、不可变。 */
   source_kind?: "novel" | "screenplay";
   style: string;
@@ -149,7 +151,7 @@ export interface ProjectData {
   image_provider_t2i?: string | null;
   image_provider_i2i?: string | null;
   /** Canonical values: storyboard | grid | reference_video. "single" is legacy-only. */
-  generation_mode?: "storyboard" | "grid" | "reference_video" | "single";
+  generation_mode?: "storyboard" | "grid" | "reference_video" | "director_storyboard" | "single";
   video_generate_audio?: boolean | null;
   /** 旁白配音（TTS）项目级覆盖：音频后端 / 音色 / 语速，留空即跟随全局默认 */
   audio_backend?: string | null;

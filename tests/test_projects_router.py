@@ -978,6 +978,32 @@ class TestProjectsRouter:
             )
             assert resp.status_code == 400
 
+    def test_create_project_with_project_type_persists(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            resp = client.post(
+                "/api/v1/projects",
+                json={
+                    "title": "剧游项目",
+                    "name": "type-template",
+                    "project_type": "interactive_drama_game",
+                },
+            )
+            assert resp.status_code == 200
+            assert fake_pm.project_data["type-template"]["project_type"] == "interactive_drama_game"
+
+            bad = client.post(
+                "/api/v1/projects",
+                json={
+                    "title": "坏模板",
+                    "name": "bad-type",
+                    "project_type": "unknown",
+                },
+            )
+            assert bad.status_code == 400
+
     def test_create_project_with_model_fields_persists(self, tmp_path, monkeypatch):
         fake_pm = _FakePM(tmp_path)
         client = _client(monkeypatch, fake_pm, _FakeCalc())
@@ -1280,6 +1306,22 @@ class TestProjectsRouter:
             assert data["style"] == ""
             assert "style_image" not in data
             assert "style_description" not in data
+
+    def test_update_project_project_type(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            resp = client.patch("/api/v1/projects/ready", json={"project_type": "ad"})
+            assert resp.status_code == 200
+            assert fake_pm.project_data["ready"]["project_type"] == "ad"
+
+            resp = client.patch("/api/v1/projects/ready", json={"project_type": None})
+            assert resp.status_code == 200
+            assert "project_type" not in fake_pm.project_data["ready"]
+
+            bad = client.patch("/api/v1/projects/ready", json={"project_type": "bad"})
+            assert bad.status_code == 400
 
     # ---------------------------------------------------------------------------
     # Episodes PATCH tests (Task 12 — reference-video mode)

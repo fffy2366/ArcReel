@@ -16,10 +16,13 @@ logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Body, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
+from sqlalchemy import select
 
 from lib.api_errors import NotFoundError
 from lib.asset_types import GLOBAL_LIBRARY_ASSET_TYPES
 from lib.config.resolver import VisionCapabilityError
+from lib.db import async_session_factory
+from lib.db.models.task import Task
 from lib.episode_paths import (
     REFERENCE_VIDEO_STEP1_FILENAME,
     REFERENCE_VIDEO_STEP1_LEGACY_FILENAME,
@@ -32,6 +35,7 @@ from lib.image_utils import normalize_uploaded_image, validate_image_bytes
 from lib.path_safety import PathTraversalError, safe_join
 from lib.project_change_hints import emit_project_change_batch, project_change_source
 from lib.project_manager import effective_mode, get_project_manager
+from lib.resource_paths import resource_relative_path
 from lib.source_loader import (
     ConflictError,
     CorruptFileError,
@@ -43,6 +47,20 @@ from lib.source_loader import (
     UnsupportedFormatError,
 )
 from server.auth import CurrentUser
+from server.services.director_script_export import build_director_storyboard_episode_script
+from server.services.draft_video_qa import (
+    build_draft_video_qa_plan,
+    merge_draft_video_generation_inputs,
+    update_draft_video_qa_item,
+)
+from server.services.keyframe_prompts import (
+    KeyframePromptPlanModel,
+    build_keyframe_prompt_plan_from_director_shots_with_text_model,
+)
+from server.services.shot_director import build_director_shot_plan_from_story_beats_with_text_model
+from server.services.story_analysis import analyze_story_import_agent, analyze_story_import_auto
+from server.services.story_beats import build_story_beat_plan_from_analysis_with_text_model
+from server.services.video_prompts import VideoPromptPlanModel, build_video_prompt_plan_with_text_model
 
 router = APIRouter()
 
@@ -690,6 +708,318 @@ def _resolve_step1_path(drafts_dir: Path, step_num: int, primary: Path) -> Path:
     return primary
 
 
+def _extract_step_number(filename: str) -> int:
+    import re
+
+    match = re.search(r"step(\d+)", filename)
+    return int(match.group(1)) if match else 0
+
+
+def _resolve_source_file_path(project_dir: Path, filename: str, _t: Translator) -> Path:
+    raw_name = str(filename)
+    if raw_name in {"", ".", ".."} or "/" in raw_name or "\\" in raw_name:
+        raise HTTPException(status_code=403, detail=_t("forbidden_access"))
+    return safe_join(project_dir, "source", raw_name)
+
+
+def _story_analysis_path(project_dir: Path, episode: int) -> Path:
+    return episode_drafts_dir(project_dir, episode) / "story_analysis.json"
+
+
+def _story_beats_path(project_dir: Path, episode: int) -> Path:
+    return episode_drafts_dir(project_dir, episode) / "story_beats.json"
+
+
+def _director_shots_path(project_dir: Path, episode: int) -> Path:
+    return episode_drafts_dir(project_dir, episode) / "director_shots.json"
+
+
+def _keyframe_prompts_path(project_dir: Path, episode: int) -> Path:
+    return episode_drafts_dir(project_dir, episode) / "keyframe_prompts.json"
+
+
+def _video_prompts_path(project_dir: Path, episode: int) -> Path:
+    return episode_drafts_dir(project_dir, episode) / "video_prompts.json"
+
+
+def _draft_video_qa_path(project_dir: Path, episode: int) -> Path:
+    return episode_drafts_dir(project_dir, episode) / "draft_video_qa.json"
+
+
+def _read_json_if_exists(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _export_director_script_from_drafts(
+    *,
+    project_name: str,
+    episode: int,
+    project: dict,
+    project_dir: Path,
+    video_prompts: dict,
+) -> dict:
+    script = build_director_storyboard_episode_script(
+        project=project,
+        episode=episode,
+        video_prompts=video_prompts,
+        director_shots=_read_json_if_exists(_director_shots_path(project_dir, episode)),
+        keyframe_prompts=_read_json_if_exists(_keyframe_prompts_path(project_dir, episode)),
+        story_analysis=_read_json_if_exists(_story_analysis_path(project_dir, episode)),
+        story_beats=_read_json_if_exists(_story_beats_path(project_dir, episode)),
+    )
+    script_filename = f"episode_{episode}.json"
+    get_project_manager().save_script(project_name, script, script_filename)
+    return {"episode": episode, "script_file": f"scripts/{script_filename}", "script": script}
+
+
+def _should_auto_export_director_script(project: dict, episode: int) -> bool:
+    ep_dict = next(
+        (ep for ep in (project.get("episodes") or []) if isinstance(ep, dict) and ep.get("episode") == episode),
+        {},
+    )
+    return effective_mode(project=project, episode=ep_dict) == "director_storyboard"
+
+
+def _with_director_script_export_response(
+    *,
+    project_name: str,
+    episode: int,
+    project: dict,
+    project_dir: Path,
+    plan: dict,
+) -> dict:
+    if not _should_auto_export_director_script(project, episode):
+        return plan
+    exported = _export_director_script_from_drafts(
+        project_name=project_name,
+        episode=episode,
+        project=project,
+        project_dir=project_dir,
+        video_prompts=plan,
+    )
+    response = dict(plan)
+    response["_exported_script"] = {
+        "episode": exported["episode"],
+        "script_file": exported["script_file"],
+        "segment_count": len((exported["script"] or {}).get("segments") or []),
+    }
+    return response
+
+
+MAX_REFERENCE_PACK_IMAGES = 9
+
+
+def _validate_reference_pack_image_limit(plan: dict) -> None:
+    for video in plan.get("videos") or []:
+        if not isinstance(video, dict):
+            continue
+        pack = video.get("reference_pack")
+        if not isinstance(pack, dict):
+            continue
+        selected_images = pack.get("selected_images")
+        if isinstance(selected_images, list) and len(selected_images) > MAX_REFERENCE_PACK_IMAGES:
+            video_id = video.get("video_id") or "unknown"
+            raise HTTPException(
+                status_code=422,
+                detail=f"reference_pack.selected_images for {video_id} is limited to {MAX_REFERENCE_PACK_IMAGES}",
+            )
+
+
+async def _latest_tasks_by_resource(project_name: str, task_type: str) -> dict[str, dict]:
+    stmt = (
+        select(
+            Task.task_id,
+            Task.resource_id,
+            Task.status,
+            Task.provider_id,
+            Task.provider_job_id,
+            Task.error_message,
+            Task.queued_at,
+            Task.started_at,
+            Task.finished_at,
+            Task.updated_at,
+        )
+        .where(Task.project_name == project_name, Task.task_type == task_type)
+        .order_by(Task.updated_at.desc(), Task.queued_at.desc())
+        .limit(500)
+    )
+    latest: dict[str, dict] = {}
+    async with async_session_factory() as session:
+        result = await session.execute(stmt)
+        for row in result.all():
+            resource_id = str(row.resource_id or "")
+            if not resource_id or resource_id in latest:
+                continue
+            latest[resource_id] = {
+                "task_id": row.task_id,
+                "task_status": row.status,
+                "task_provider_id": row.provider_id,
+                "task_provider_job_id": row.provider_job_id,
+                "task_error_message": row.error_message,
+                "task_queued_at": row.queued_at.isoformat() if row.queued_at else None,
+                "task_started_at": row.started_at.isoformat() if row.started_at else None,
+                "task_finished_at": row.finished_at.isoformat() if row.finished_at else None,
+                "task_updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            }
+    return latest
+
+
+def _build_keyframes_status(
+    project_dir: Path,
+    episode: int,
+    _t: Translator,
+    *,
+    latest_tasks_by_resource: dict[str, dict] | None = None,
+) -> dict:
+    prompts_path = _keyframe_prompts_path(project_dir, episode)
+    if not prompts_path.exists():
+        raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+    plan = json.loads(prompts_path.read_text(encoding="utf-8"))
+    frames = []
+    for item in plan.get("prompts") or []:
+        keyframe_id = str(item.get("keyframe_id") or "").strip()
+        role = str(item.get("role") or "")
+        file_path = resource_relative_path("keyframe", keyframe_id) if role != "review_frame" else None
+        abs_path = project_dir / file_path if file_path else None
+        exists = bool(abs_path and abs_path.exists())
+        status_item = {
+            "keyframe_id": keyframe_id,
+            "shot_id": item.get("shot_id"),
+            "role": role,
+            "file_path": file_path,
+            "exists": exists,
+            "fingerprint": abs_path.stat().st_mtime_ns if exists and abs_path else None,
+        }
+        latest_task = (latest_tasks_by_resource or {}).get(keyframe_id)
+        if latest_task:
+            status_item.update(latest_task)
+        frames.append(status_item)
+    return {"schema_version": 1, "episode": episode, "frames": frames}
+
+
+def _draft_video_generation_inputs(project_dir: Path, video_id: str) -> dict | None:
+    versions_file = project_dir / "versions" / "versions.json"
+    if not versions_file.exists():
+        return None
+    try:
+        versions_data = json.loads(versions_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    resource_data = (versions_data.get("draft_videos") or {}).get(video_id)
+    versions = resource_data.get("versions") if isinstance(resource_data, dict) else None
+    if not isinstance(versions, list):
+        return None
+    current_version = resource_data.get("current_version")
+    current_record = next(
+        (item for item in versions if isinstance(item, dict) and item.get("version") == current_version),
+        None,
+    )
+    if current_record is None and versions:
+        current_record = next((item for item in reversed(versions) if isinstance(item, dict)), None)
+    if not isinstance(current_record, dict):
+        return None
+    generation_inputs = current_record.get("last_generation_inputs")
+    return generation_inputs if isinstance(generation_inputs, dict) else None
+
+
+def _build_draft_videos_status(
+    project_dir: Path,
+    episode: int,
+    _t: Translator,
+    *,
+    latest_tasks_by_resource: dict[str, dict] | None = None,
+) -> dict:
+    prompts_path = _video_prompts_path(project_dir, episode)
+    if not prompts_path.exists():
+        raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+    plan = json.loads(prompts_path.read_text(encoding="utf-8"))
+    videos = []
+    for item in plan.get("videos") or []:
+        video_id = str(item.get("video_id") or "").strip()
+        file_path = resource_relative_path("draft_video", video_id)
+        abs_path = project_dir / file_path
+        exists = abs_path.exists()
+        status_item = {
+            "video_id": video_id,
+            "shot_id": item.get("shot_id"),
+            "keyframe_id": item.get("keyframe_id"),
+            "file_path": file_path,
+            "exists": exists,
+            "fingerprint": abs_path.stat().st_mtime_ns if exists else None,
+            "generation_inputs": _draft_video_generation_inputs(project_dir, video_id) if exists else None,
+        }
+        latest_task = (latest_tasks_by_resource or {}).get(video_id)
+        if latest_task:
+            status_item.update(latest_task)
+        videos.append(status_item)
+    return {"schema_version": 1, "episode": episode, "videos": videos}
+
+
+def _read_story_analysis_source(
+    project_name: str,
+    project_dir: Path,
+    episode: int,
+    source_filename: str | None,
+    _t: Translator,
+) -> tuple[str, str | None]:
+    if source_filename:
+        source_path = _resolve_source_file_path(project_dir, source_filename, _t)
+        if not source_path.exists():
+            raise HTTPException(status_code=404, detail=_t("file_not_found", path=source_filename))
+        return source_path.read_text(encoding="utf-8"), source_path.name
+
+    source_dir = project_dir / "source"
+    if source_dir.exists():
+        for candidate in sorted(source_dir.iterdir()):
+            if candidate.is_file() and not candidate.name.startswith("."):
+                return candidate.read_text(encoding="utf-8"), candidate.name
+
+    content_mode, generation_mode = _load_project_modes(project_name, episode)
+    step_files = _get_step_files(content_mode, generation_mode)
+    drafts_dir = episode_drafts_dir(project_dir, episode)
+    draft_path = _resolve_step1_path(drafts_dir, 1, drafts_dir / step_files[1])
+    if draft_path.exists():
+        return draft_path.read_text(encoding="utf-8"), None
+
+    raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+
+
+@router.get("/projects/{project_name}/drafts")
+async def list_drafts(project_name: str, _user: CurrentUser, _t: Translator):
+    """列出项目已有草稿文件。"""
+    try:
+        def _sync():
+            project_dir = get_project_manager().get_project_path(project_name)
+            root = project_dir / "drafts"
+            drafts = []
+            if not root.exists():
+                return {"drafts": drafts}
+            for episode_dir in sorted(root.glob("episode_*")):
+                if not episode_dir.is_dir():
+                    continue
+                try:
+                    episode = int(episode_dir.name.split("_", 1)[1])
+                except (IndexError, ValueError):
+                    continue
+                for path in sorted(episode_dir.iterdir()):
+                    if path.is_file():
+                        drafts.append(
+                            {
+                                "episode": episode,
+                                "step": _extract_step_number(path.name),
+                                "filename": path.name,
+                                "modified_at": str(path.stat().st_mtime),
+                            }
+                        )
+            return {"drafts": drafts}
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
 @router.get("/projects/{project_name}/drafts/{episode}/step{step_num}")
 async def get_draft_content(project_name: str, episode: int, step_num: int, _user: CurrentUser, _t: Translator):
     """获取特定步骤的草稿内容"""
@@ -822,6 +1152,481 @@ async def delete_draft(project_name: str, episode: int, step_num: int, _user: Cu
 
         return await asyncio.to_thread(_sync)
 
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.get("/projects/{project_name}/drafts/{episode}/analysis")
+async def get_story_analysis(project_name: str, episode: int, _user: CurrentUser, _t: Translator):
+    try:
+        def _sync():
+            project_dir = get_project_manager().get_project_path(project_name)
+            path = _story_analysis_path(project_dir, episode)
+            if not path.exists():
+                raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.put("/projects/{project_name}/drafts/{episode}/analysis")
+async def update_story_analysis(
+    project_name: str,
+    episode: int,
+    _user: CurrentUser,
+    _t: Translator,
+    payload: dict = Body(...),
+):
+    try:
+        def _sync():
+            project_dir = get_project_manager().get_project_path(project_name)
+            data = dict(payload)
+            data.setdefault("schema_version", 1)
+            data["episode"] = episode
+            path = _story_analysis_path(project_dir, episode)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            return data
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.post("/projects/{project_name}/drafts/{episode}/analysis/generate")
+async def generate_story_analysis(
+    project_name: str,
+    episode: int,
+    _user: CurrentUser,
+    _t: Translator,
+    payload: dict | None = Body(default=None),
+):
+    try:
+        def _load_inputs():
+            project_dir = get_project_manager().get_project_path(project_name)
+            project = get_project_manager().load_project(project_name)
+            source_filename = str((payload or {}).get("source_filename") or "").strip() or None
+            text, resolved_source = _read_story_analysis_source(project_name, project_dir, episode, source_filename, _t)
+            return project_dir, project, text, resolved_source
+
+        project_dir, project, text, resolved_source = await asyncio.to_thread(_load_inputs)
+        requested_engine = str((payload or {}).get("engine") or "").strip()
+        ep_dict = next(
+            (ep for ep in (project.get("episodes") or []) if isinstance(ep, dict) and ep.get("episode") == episode),
+            {},
+        )
+        generation_mode = effective_mode(project=project, episode=ep_dict)
+        engine = requested_engine or ("auto" if generation_mode == "director_storyboard" else "agent")
+        if engine == "agent":
+            from server.routers.assistant import get_assistant_service
+
+            service = get_assistant_service()
+
+            async def _run_agent(prompt: str, schema: dict) -> dict:
+                return await service.run_structured_once(project_name, prompt, schema=schema)
+
+            try:
+                analysis = await analyze_story_import_agent(
+                    text,
+                    project=project,
+                    episode=episode,
+                    source_filename=resolved_source,
+                    agent_runner=_run_agent,
+                )
+            except Exception:
+                logger.warning("story analysis agent failed; falling back to auto analyzer", exc_info=True)
+                analysis = await analyze_story_import_auto(
+                    text,
+                    project=project,
+                    episode=episode,
+                    source_filename=resolved_source,
+                    project_name=project_name,
+                    engine="auto",
+                )
+        else:
+            analysis = await analyze_story_import_auto(
+                text,
+                project=project,
+                episode=episode,
+                source_filename=resolved_source,
+                project_name=project_name,
+                engine=engine if engine in {"auto", "llm", "deterministic"} else "auto",
+            )
+
+        def _sync_write():
+            path = _story_analysis_path(project_dir, episode)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
+            return analysis
+
+        return await asyncio.to_thread(_sync_write)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.get("/projects/{project_name}/drafts/{episode}/story-beats")
+async def get_story_beats(project_name: str, episode: int, _user: CurrentUser, _t: Translator):
+    try:
+        def _sync():
+            project_dir = get_project_manager().get_project_path(project_name)
+            path = _story_beats_path(project_dir, episode)
+            if not path.exists():
+                raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.post("/projects/{project_name}/drafts/{episode}/story-beats/generate")
+async def generate_story_beats(project_name: str, episode: int, _user: CurrentUser, _t: Translator):
+    try:
+        def _sync_load():
+            project_dir = get_project_manager().get_project_path(project_name)
+            path = _story_analysis_path(project_dir, episode)
+            if not path.exists():
+                raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+            return project_dir, json.loads(path.read_text(encoding="utf-8"))
+
+        project_dir, analysis = await asyncio.to_thread(_sync_load)
+        plan = await build_story_beat_plan_from_analysis_with_text_model(analysis, project_name=project_name)
+
+        def _sync_write():
+            path = _story_beats_path(project_dir, episode)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+            return plan
+
+        return await asyncio.to_thread(_sync_write)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.get("/projects/{project_name}/drafts/{episode}/director-shots")
+async def get_director_shots(project_name: str, episode: int, _user: CurrentUser, _t: Translator):
+    try:
+        def _sync():
+            project_dir = get_project_manager().get_project_path(project_name)
+            path = _director_shots_path(project_dir, episode)
+            if not path.exists():
+                raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.post("/projects/{project_name}/drafts/{episode}/director-shots/generate")
+async def generate_director_shots(project_name: str, episode: int, _user: CurrentUser, _t: Translator):
+    try:
+        def _sync_load():
+            project_dir = get_project_manager().get_project_path(project_name)
+            path = _story_beats_path(project_dir, episode)
+            if not path.exists():
+                raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+            return project_dir, json.loads(path.read_text(encoding="utf-8"))
+
+        project_dir, story_beats = await asyncio.to_thread(_sync_load)
+        plan = await build_director_shot_plan_from_story_beats_with_text_model(story_beats, project_name=project_name)
+
+        def _sync_write():
+            path = _director_shots_path(project_dir, episode)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+            return plan
+
+        return await asyncio.to_thread(_sync_write)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.get("/projects/{project_name}/drafts/{episode}/keyframe-prompts")
+async def get_keyframe_prompts(project_name: str, episode: int, _user: CurrentUser, _t: Translator):
+    try:
+        def _sync():
+            project_dir = get_project_manager().get_project_path(project_name)
+            path = _keyframe_prompts_path(project_dir, episode)
+            if not path.exists():
+                raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.put("/projects/{project_name}/drafts/{episode}/keyframe-prompts")
+async def update_keyframe_prompts(
+    project_name: str,
+    episode: int,
+    _user: CurrentUser,
+    _t: Translator,
+    payload: dict = Body(...),
+):
+    try:
+        def _sync():
+            project_dir = get_project_manager().get_project_path(project_name)
+            data = dict(payload)
+            data["episode"] = episode
+            validated = KeyframePromptPlanModel.model_validate(data).model_dump()
+            path = _keyframe_prompts_path(project_dir, episode)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(validated, ensure_ascii=False, indent=2), encoding="utf-8")
+            return validated
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.post("/projects/{project_name}/drafts/{episode}/keyframe-prompts/generate")
+async def generate_keyframe_prompts(project_name: str, episode: int, _user: CurrentUser, _t: Translator):
+    try:
+        def _sync_load():
+            project_dir = get_project_manager().get_project_path(project_name)
+            shots_path = _director_shots_path(project_dir, episode)
+            if not shots_path.exists():
+                raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+            director_shots = json.loads(shots_path.read_text(encoding="utf-8"))
+            beats_path = _story_beats_path(project_dir, episode)
+            story_beats = json.loads(beats_path.read_text(encoding="utf-8")) if beats_path.exists() else None
+            return project_dir, director_shots, story_beats
+
+        project_dir, director_shots, story_beats = await asyncio.to_thread(_sync_load)
+        plan = await build_keyframe_prompt_plan_from_director_shots_with_text_model(
+            director_shots,
+            story_beats,
+            project_name=project_name,
+        )
+
+        def _sync_write():
+            path = _keyframe_prompts_path(project_dir, episode)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+            return plan
+
+        return await asyncio.to_thread(_sync_write)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.get("/projects/{project_name}/drafts/{episode}/keyframes")
+async def get_keyframes(project_name: str, episode: int, _user: CurrentUser, _t: Translator):
+    try:
+        latest_tasks = await _latest_tasks_by_resource(project_name, "keyframe")
+
+        def _sync():
+            project_dir = get_project_manager().get_project_path(project_name)
+            return _build_keyframes_status(project_dir, episode, _t, latest_tasks_by_resource=latest_tasks)
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.get("/projects/{project_name}/drafts/{episode}/video-prompts")
+async def get_video_prompts(project_name: str, episode: int, _user: CurrentUser, _t: Translator):
+    try:
+        def _sync():
+            project_dir = get_project_manager().get_project_path(project_name)
+            path = _video_prompts_path(project_dir, episode)
+            if not path.exists():
+                raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.put("/projects/{project_name}/drafts/{episode}/video-prompts")
+async def update_video_prompts(
+    project_name: str,
+    episode: int,
+    _user: CurrentUser,
+    _t: Translator,
+    payload: dict = Body(...),
+):
+    try:
+        def _sync():
+            project = get_project_manager().load_project(project_name)
+            project_dir = get_project_manager().get_project_path(project_name)
+            data = dict(payload)
+            data["episode"] = episode
+            validated = VideoPromptPlanModel.model_validate(data).model_dump()
+            _validate_reference_pack_image_limit(validated)
+            path = _video_prompts_path(project_dir, episode)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(validated, ensure_ascii=False, indent=2), encoding="utf-8")
+            return _with_director_script_export_response(
+                project_name=project_name,
+                episode=episode,
+                project=project,
+                project_dir=project_dir,
+                plan=validated,
+            )
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.post("/projects/{project_name}/drafts/{episode}/video-prompts/generate")
+async def generate_video_prompts(project_name: str, episode: int, _user: CurrentUser, _t: Translator):
+    try:
+        def _sync_load():
+            project = get_project_manager().load_project(project_name)
+            project_dir = get_project_manager().get_project_path(project_name)
+            keyframe_path = _keyframe_prompts_path(project_dir, episode)
+            director_path = _director_shots_path(project_dir, episode)
+            if not director_path.exists():
+                raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+            keyframe_prompts = (
+                json.loads(keyframe_path.read_text(encoding="utf-8"))
+                if keyframe_path.exists()
+                else {"schema_version": 1, "episode": episode, "prompts": []}
+            )
+            director_shots = json.loads(director_path.read_text(encoding="utf-8"))
+            keyframe_status = _build_keyframes_status(project_dir, episode, _t) if keyframe_path.exists() else None
+            return project, project_dir, keyframe_prompts, director_shots, keyframe_status
+
+        project, project_dir, keyframe_prompts, director_shots, keyframe_status = await asyncio.to_thread(_sync_load)
+        plan = await build_video_prompt_plan_with_text_model(
+            keyframe_prompts=keyframe_prompts,
+            director_shots=director_shots,
+            keyframe_status=keyframe_status,
+            project=project,
+            project_dir=project_dir,
+            project_name=project_name,
+        )
+
+        def _sync_write():
+            path = _video_prompts_path(project_dir, episode)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+            return _with_director_script_export_response(
+                project_name=project_name,
+                episode=episode,
+                project=project,
+                project_dir=project_dir,
+                plan=plan,
+            )
+
+        return await asyncio.to_thread(_sync_write)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.post("/projects/{project_name}/drafts/{episode}/export-script")
+async def export_director_script(project_name: str, episode: int, _user: CurrentUser, _t: Translator):
+    try:
+        def _sync():
+            project = get_project_manager().load_project(project_name)
+            project_dir = get_project_manager().get_project_path(project_name)
+            video_prompts_path = _video_prompts_path(project_dir, episode)
+            if not video_prompts_path.exists():
+                raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+            return _export_director_script_from_drafts(
+                project_name=project_name,
+                episode=episode,
+                project=project,
+                project_dir=project_dir,
+                video_prompts=json.loads(video_prompts_path.read_text(encoding="utf-8")),
+            )
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.get("/projects/{project_name}/drafts/{episode}/draft-videos")
+async def get_draft_videos(project_name: str, episode: int, _user: CurrentUser, _t: Translator):
+    try:
+        latest_tasks = await _latest_tasks_by_resource(project_name, "draft_video")
+
+        def _sync():
+            project_dir = get_project_manager().get_project_path(project_name)
+            return _build_draft_videos_status(project_dir, episode, _t, latest_tasks_by_resource=latest_tasks)
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.get("/projects/{project_name}/drafts/{episode}/draft-video-qa")
+async def get_draft_video_qa(project_name: str, episode: int, _user: CurrentUser, _t: Translator):
+    try:
+        def _sync():
+            project_dir = get_project_manager().get_project_path(project_name)
+            path = _draft_video_qa_path(project_dir, episode)
+            if not path.exists():
+                raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+            qa_plan = json.loads(path.read_text(encoding="utf-8"))
+            draft_video_status = _build_draft_videos_status(project_dir, episode, _t)
+            return merge_draft_video_generation_inputs(qa_plan, draft_video_status=draft_video_status)
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.post("/projects/{project_name}/drafts/{episode}/draft-video-qa/generate")
+async def generate_draft_video_qa(project_name: str, episode: int, _user: CurrentUser, _t: Translator):
+    try:
+        def _sync():
+            project_dir = get_project_manager().get_project_path(project_name)
+            prompts_path = _video_prompts_path(project_dir, episode)
+            if not prompts_path.exists():
+                raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+            video_prompts = json.loads(prompts_path.read_text(encoding="utf-8"))
+            draft_video_status = _build_draft_videos_status(project_dir, episode, _t)
+            plan = build_draft_video_qa_plan(video_prompts=video_prompts, draft_video_status=draft_video_status)
+            path = _draft_video_qa_path(project_dir, episode)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+            return plan
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=project_name) from exc
+
+
+@router.patch("/projects/{project_name}/drafts/{episode}/draft-video-qa/{video_id}")
+async def update_draft_video_qa(
+    project_name: str,
+    episode: int,
+    video_id: str,
+    _user: CurrentUser,
+    _t: Translator,
+    payload: dict = Body(...),
+):
+    try:
+        def _sync():
+            project_dir = get_project_manager().get_project_path(project_name)
+            path = _draft_video_qa_path(project_dir, episode)
+            if not path.exists():
+                raise HTTPException(status_code=404, detail=_t("draft_file_not_found"))
+            qa_plan = json.loads(path.read_text(encoding="utf-8"))
+            draft_video_status = _build_draft_videos_status(project_dir, episode, _t)
+            qa_plan = merge_draft_video_generation_inputs(qa_plan, draft_video_status=draft_video_status)
+            try:
+                updated = update_draft_video_qa_item(
+                    qa_plan,
+                    video_id=video_id,
+                    status=str(payload.get("status") or "needs_review"),
+                    issue_type=payload.get("issue_type"),
+                    note=str(payload.get("note") or ""),
+                )
+            except KeyError:
+                raise HTTPException(status_code=404, detail=_t("draft_video_not_found", video_id=video_id))
+            path.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
+            return updated
+
+        return await asyncio.to_thread(_sync)
     except FileNotFoundError as exc:
         raise NotFoundError("project_not_found", name=project_name) from exc
 

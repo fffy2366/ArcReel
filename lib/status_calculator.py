@@ -357,7 +357,10 @@ class StatusCalculator:
                     preloaded_scripts=preloaded_scripts,
                 )
             else:
-                script_status, script = "none", None
+                # director_storyboard mode: no traditional script, segmented workflow
+                generation_mode = ep.get("generation_mode") or project.get("generation_mode")
+                script_status = "segmented" if generation_mode == "director_storyboard" else "none"
+                script = None
 
             if script_status == "generated" and script is not None:
                 ep_stats = self.calculate_episode_stats(

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Story Beat"
+  short_description: "拆小说、剧本、广告或解说文本为类型化剧情节拍"
+  default_prompt: "把这段文本按 story-beat skill 拆成类型化 beat，标出可见动作、状态变化、时长和是否需要拆镜头。"

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Sparkles } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { ScriptReviewGate } from "./ScriptReviewGate";
@@ -22,6 +22,32 @@ import type {
 } from "@/types";
 
 type Segment = NarrationSegment | DramaScene | AdShot;
+type EditorContentMode = "narration" | "drama" | "ad";
+
+function resolveEditorContentMode(
+  episodeScript: EpisodeScript | null,
+  projectData: ProjectData | null,
+): EditorContentMode {
+  const scriptMode = (episodeScript as { content_mode?: unknown } | null)?.content_mode;
+  if (scriptMode === "narration" || scriptMode === "drama" || scriptMode === "ad") {
+    return scriptMode;
+  }
+
+  const record = episodeScript as unknown as {
+    segments?: unknown;
+    scenes?: unknown;
+    shots?: unknown;
+  } | null;
+  if (Array.isArray(record?.segments) && record.segments.length > 0) return "narration";
+  if (Array.isArray(record?.scenes) && record.scenes.length > 0) return "drama";
+  if (Array.isArray(record?.shots) && record.shots.length > 0) return "ad";
+
+  const projectMode = projectData?.content_mode;
+  if (projectMode === "narration" || projectMode === "drama" || projectMode === "ad") {
+    return projectMode;
+  }
+  return "drama";
+}
 
 interface TimelineCanvasProps {
   projectName: string;
@@ -50,6 +76,7 @@ interface TimelineCanvasProps {
   onRestoreVideo?: () => Promise<void> | void;
   onSaveTitle?: (next: string) => Promise<void>;
   canEditTitle?: boolean;
+  preprocessingView?: ReactNode;
 }
 
 /**
@@ -88,14 +115,12 @@ export function TimelineCanvas(props: TimelineCanvasProps) {
     onRestoreVideo,
     onSaveTitle,
     canEditTitle,
+    preprocessingView,
   } = demoReadOnly ? { ...props, ...DEMO_READ_ONLY_PROPS } : props;
 
   const { t } = useTranslation("dashboard");
-  const contentMode = projectData?.content_mode ?? "narration";
-  // 分镜编辑子视图按剧本形状显式分派：narration（segments）/ drama（scenes）/ ad（shots）。
-  // 未知/脏 content_mode 沿用历史兜底落 drama 视图。
-  const editorContentMode: "narration" | "drama" | "ad" =
-    contentMode === "narration" ? "narration" : contentMode === "ad" ? "ad" : "drama";
+  const projectContentMode = projectData?.content_mode ?? "narration";
+  const editorContentMode = resolveEditorContentMode(episodeScript, projectData);
 
   const hasScript = Boolean(episodeScript);
   // ad 一键生成不走预处理中间文件，预处理 tab 对 ad 无意义，仅 timeline 单 tab
@@ -126,24 +151,20 @@ export function TimelineCanvas(props: TimelineCanvasProps) {
     typeof projectData?.aspect_ratio === "string"
       ? projectData.aspect_ratio
       : projectData?.aspect_ratio?.storyboard ??
-        (contentMode === "narration" || contentMode === "ad" ? "9:16" : "16:9");
+        (projectContentMode === "narration" || projectContentMode === "ad" ? "9:16" : "16:9");
   const aspectRatio: "9:16" | "16:9" =
     rawAspect === "9:16" || rawAspect === "16:9" ? rawAspect : "16:9";
 
-  // 仅三种已注册模式显式取数；未知/脏 content_mode 返回空列表（不渲染可编辑视图）——
-  // 否则会以 drama 形状渲染、保存却按真实 content_mode 分派到错误端点。
   const segments = useMemo<Segment[]>(
     () =>
       !episodeScript || !projectData
         ? []
-        : contentMode === "narration"
+        : editorContentMode === "narration"
           ? ((episodeScript as NarrationEpisodeScript).segments ?? [])
-          : contentMode === "ad"
+          : editorContentMode === "ad"
             ? ((episodeScript as AdEpisodeScript).shots ?? [])
-            : contentMode === "drama"
-              ? ((episodeScript as DramaEpisodeScript).scenes ?? [])
-              : [],
-    [contentMode, episodeScript, projectData],
+            : ((episodeScript as DramaEpisodeScript).scenes ?? []),
+    [editorContentMode, episodeScript, projectData],
   );
 
   // 任务派生 loading：活跃 + 最新行胜出下沉到 store selector（各 task_type 一组活跃 resource）
@@ -306,7 +327,7 @@ export function TimelineCanvas(props: TimelineCanvasProps) {
               <Sparkles className="h-3 w-3" />
               <span>{t("batch_generate_videos")}</span>
             </button>
-            {contentMode === "narration" && onGenerateEpisodeNarration && (
+            {editorContentMode === "narration" && onGenerateEpisodeNarration && (
               <button
                 type="button"
                 className="sv-navbtn inline-flex items-center gap-1.5"
@@ -328,19 +349,22 @@ export function TimelineCanvas(props: TimelineCanvasProps) {
         data-onboarding={ONBOARDING_ANCHORS.workbenchTimeline}
       >
         {activeTab === "preprocessing" && hasDraft && editorContentMode !== "ad" ? (
-          <div className="h-full overflow-y-auto p-4">
-            <ScriptReviewGate
-              key={`${projectName}:${episode}`}
-              projectName={projectName}
-              episode={episode}
-              contentMode={editorContentMode}
-            />
-          </div>
+          preprocessingView ?? (
+            <div className="h-full overflow-y-auto p-4">
+              <ScriptReviewGate
+                key={`${projectName}:${episode}`}
+                projectName={projectName}
+                episode={episode}
+                contentMode={editorContentMode}
+              />
+            </div>
+          )
         ) : episodeScript && segments.length > 0 ? (
           <div className="flex h-full flex-col">
             <div className="min-h-0 flex-1 overflow-hidden">
               <ShotSplitView
                 segments={segments}
+                episode={episode}
                 contentMode={editorContentMode}
                 aspectRatio={aspectRatio}
                 projectName={projectName}
@@ -362,7 +386,7 @@ export function TimelineCanvas(props: TimelineCanvasProps) {
             </div>
           </div>
         ) : (
-          // 兜底：timeline tab 下无可编辑分镜（剧本为空列表或未知 content_mode），
+          // 兜底：timeline tab 下无可编辑分镜（剧本为空列表），
           // 或剧本回退后 tab 仍停留在 timeline——给出指引而非空白
           <div
             className="flex h-full items-center justify-center text-[13px]"

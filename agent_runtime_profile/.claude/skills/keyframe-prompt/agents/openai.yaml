@@ -1,0 +1,4 @@
+interface:
+  display_name: "Keyframe Prompt"
+  short_description: "把分镜的起始帧、引导参考图、结束帧编译成清晰生图提示词"
+  default_prompt: "根据 shot-director 输出，为每个分镜生成起始帧、引导参考图、结束帧等关键帧提示词，并明确它们提交给视频模型的角色。"

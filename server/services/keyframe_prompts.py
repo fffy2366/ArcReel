@@ -17,11 +17,14 @@ from pydantic import BaseModel, Field
 
 from lib.text_backends.base import TextGenerationRequest, TextTaskType
 from lib.text_generator import TextGenerator
+from server.services.preprocessing_model_config import env_int
 from server.services.text_model_json import parse_model_json_object
 
 logger = logging.getLogger(__name__)
 
-KEYFRAME_PROMPT_MODEL_TIMEOUT_SECONDS = 25
+KEYFRAME_PROMPT_MODEL_TIMEOUT_SECONDS = env_int("ARCREEL_KEYFRAME_PROMPT_MODEL_TIMEOUT_SECONDS", 120)
+KEYFRAME_PROMPT_MODEL_MAX_OUTPUT_TOKENS = env_int("ARCREEL_KEYFRAME_PROMPT_MODEL_MAX_OUTPUT_TOKENS", 12000)
+KEYFRAME_PROMPT_BATCH_SIZE = env_int("ARCREEL_KEYFRAME_PROMPT_BATCH_SIZE", 4)
 KEYFRAME_PROMPT_MODEL_FAILURE_BREAKER = 1
 
 
@@ -737,7 +740,6 @@ def _grid_cells_for_shot(
     camera_text = camera or _camera_text(shot)
     movement_text = camera_movement or "轻微推进"
     clauses = _event_clauses(action_text, source_text, subject_text)
-    setup_part = _event_part(clauses, 0, subject_text)
     trigger_part = _event_part(clauses, 1, action_text)
     develop_part = _event_part(clauses, 2, action_text)
     detail_part = _event_part(clauses, 3, subject_text)
@@ -1156,7 +1158,11 @@ def _keyframe_user_prompt(
     )
 
 
-def _director_shot_batches(director_shots: dict[str, Any], *, batch_size: int = 8) -> list[dict[str, Any]]:
+def _director_shot_batches(
+    director_shots: dict[str, Any],
+    *,
+    batch_size: int = KEYFRAME_PROMPT_BATCH_SIZE,
+) -> list[dict[str, Any]]:
     """Flatten director shots into small prompt-generation batches."""
     episode = _as_int(director_shots.get("episode"), 1)
     content = {key: value for key, value in director_shots.items() if key != "shot_groups"}
@@ -1265,13 +1271,13 @@ async def build_keyframe_prompt_plan_from_director_shots_with_text_model(
     try:
         generator = await TextGenerator.create(TextTaskType.KEYFRAME_PROMPTS, project_name=project_name)
     except Exception as exc:
-        logger.warning("关键帧提示词文本模型初始化失败，回退到规则模板: %s", exc)
+        logger.warning("关键帧提示词文本模型初始化失败，回退到规则模板: %r", exc)
         return fallback
 
     fallback_by_shot = {str(item.get("shot_id") or ""): item for item in fallback.get("prompts") or []}
     merged_prompts: list[dict[str, Any]] = []
     consecutive_failures = 0
-    for batch_index, batch in enumerate(_director_shot_batches(director_shots, batch_size=8), start=1):
+    for batch_index, batch in enumerate(_director_shot_batches(director_shots), start=1):
         batch_fallback = build_keyframe_prompt_plan_from_director_shots(batch, story_beats)
         if consecutive_failures >= KEYFRAME_PROMPT_MODEL_FAILURE_BREAKER:
             for item in batch_fallback.get("prompts") or []:
@@ -1288,7 +1294,7 @@ async def build_keyframe_prompt_plan_from_director_shots_with_text_model(
                             story_beats,
                             requirements="为这批 director_shots 生成 keyframe_prompts.json，只输出本批 prompts，不要漏 shot。",
                         ),
-                        max_output_tokens=8000,
+                        max_output_tokens=KEYFRAME_PROMPT_MODEL_MAX_OUTPUT_TOKENS,
                     ),
                     project_name=project_name,
                 ),
@@ -1300,7 +1306,7 @@ async def build_keyframe_prompt_plan_from_director_shots_with_text_model(
             merged_prompts.extend(batch_plan.get("prompts") or [])
             consecutive_failures = 0
         except Exception as exc:
-            logger.warning("关键帧提示词第 %s 批文本模型生成失败，回退该批规则模板: %s", batch_index, exc)
+            logger.warning("关键帧提示词第 %s 批文本模型生成失败，回退该批规则模板: %r", batch_index, exc)
             consecutive_failures += 1
             for item in batch_fallback.get("prompts") or []:
                 original = fallback_by_shot.get(str(item.get("shot_id") or ""))

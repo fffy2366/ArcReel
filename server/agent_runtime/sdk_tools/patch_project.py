@@ -20,6 +20,7 @@ from claude_agent_sdk import tool
 
 from lib.asset_types import ASSET_SPECS
 from server.agent_runtime.sdk_tools._context import ToolContext, tool_error
+from server.services.project_type_templates import PROJECT_TYPE_TEMPLATES
 
 # 资产表清单从 ASSET_SPECS 派生，新增资产类型时 schema enum 自动跟进。
 _TABLES = tuple(spec.bucket_key for spec in ASSET_SPECS.values())
@@ -36,6 +37,7 @@ _SETTINGS_WHITELIST = (
     "brief",
     "planning_window_chars",
     "planning_max_episodes",
+    "project_type",
     "narration_voice",
     "narration_speed",
 )
@@ -242,6 +244,13 @@ def _coerce_setting_value(key: str, value: Any) -> Any:
         if not isinstance(value, str):
             raise ValueError(f"brief 必须是字符串或 null,收到 {value!r}")
         return value
+    if key == "project_type":
+        if value is None:
+            return None
+        project_type = str(value).strip()
+        if project_type not in PROJECT_TYPE_TEMPLATES:
+            raise ValueError(f"project_type must be one of {sorted(PROJECT_TYPE_TEMPLATES)}, got {project_type!r}")
+        return project_type
     if key == "narration_voice":
         if value is None:
             return None

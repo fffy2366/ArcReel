@@ -1,0 +1,4 @@
+interface:
+  display_name: "Seedance 提示词优化"
+  short_description: "把粗糙创意或现有视频提示词优化成 Seedance 2.0 可直接生成的专业提示词。"
+  default_prompt: "请使用 seedance-video-prompt-optimizer，把下面的视频创意优化为 Seedance 2.0 专业提示词，控制在 1900 字以内。"

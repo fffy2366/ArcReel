@@ -19,12 +19,14 @@ from lib.resource_paths import resource_relative_path
 from lib.text_backends.base import TextGenerationRequest, TextTaskType
 from lib.text_generator import TextGenerator
 from lib.video_duration import MIN_VIDEO_DURATION_SECONDS, coerce_video_duration
+from server.services.preprocessing_model_config import env_int
 from server.services.text_model_json import parse_model_json_object
 
 logger = logging.getLogger(__name__)
 
-VIDEO_PROMPT_MODEL_TIMEOUT_SECONDS = 25
-VIDEO_PROMPT_BATCH_SIZE = 8
+VIDEO_PROMPT_MODEL_TIMEOUT_SECONDS = env_int("ARCREEL_VIDEO_PROMPT_MODEL_TIMEOUT_SECONDS", 120)
+VIDEO_PROMPT_MODEL_MAX_OUTPUT_TOKENS = env_int("ARCREEL_VIDEO_PROMPT_MODEL_MAX_OUTPUT_TOKENS", 12000)
+VIDEO_PROMPT_BATCH_SIZE = env_int("ARCREEL_VIDEO_PROMPT_BATCH_SIZE", 2)
 
 
 class VideoReferenceEntryModel(BaseModel):
@@ -1131,7 +1133,7 @@ async def build_video_prompt_plan_with_text_model(
     try:
         generator = await TextGenerator.create(TextTaskType.VIDEO_PROMPTS, project_name=project_name)
     except Exception as exc:
-        logger.warning("视频提示词文本模型初始化失败，回退到规则模板: %s", exc)
+        logger.warning("视频提示词文本模型初始化失败，回退到规则模板: %r", exc)
         return fallback
 
     fallback_by_id = {str(video.get("video_id") or ""): video for video in fallback.get("videos") or []}
@@ -1168,7 +1170,7 @@ async def build_video_prompt_plan_with_text_model(
                             },
                             ensure_ascii=False,
                         ),
-                        max_output_tokens=6000,
+                        max_output_tokens=VIDEO_PROMPT_MODEL_MAX_OUTPUT_TOKENS,
                     ),
                     project_name=project_name,
                 ),
@@ -1180,7 +1182,7 @@ async def build_video_prompt_plan_with_text_model(
                 raise ValueError("video prompt model returned empty videos")
             batch_videos = batch_plan.get("videos") or []
         except Exception as exc:
-            logger.warning("视频提示词第 %d 批生成失败，使用该批规则模板: %s", batch_index, exc)
+            logger.warning("视频提示词第 %d 批生成失败，使用该批规则模板: %r", batch_index, exc)
             batch_videos = batch_fallback.get("videos") or []
 
         for video in batch_videos:

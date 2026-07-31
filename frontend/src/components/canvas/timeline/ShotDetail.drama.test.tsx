@@ -128,4 +128,79 @@ describe("ShotDetail drama 模式", () => {
     expect(screen.getByText("添加台词").closest("button")).toBeDisabled();
     expect(screen.getByDisplayValue("你终于回来了。")).toBeDisabled();
   });
+
+  it("导演分镜链路优先展示 9 宫格动作引导图", () => {
+    renderDetail({
+      keyframePrompt: {
+        keyframe_id: "KF-E1S01-guide",
+        shot_id: "E1S01",
+        role: "guide_reference",
+        title: "动作引导",
+        image_role_explanation: "",
+        prompt: "九宫格动作草稿",
+        optional_reference_roles: [],
+        review_checkpoints: [],
+      },
+      keyframeFrame: {
+        keyframe_id: "KF-E1S01-guide",
+        shot_id: "E1S01",
+        role: "guide_reference",
+        file_path: "keyframes/KF-E1S01-guide.png",
+        exists: true,
+        fingerprint: 123,
+      },
+      keyframeExists: true,
+    });
+
+    expect(screen.getByText("9宫格动作引导图")).toBeInTheDocument();
+    const image = screen.getByAltText("9宫格动作引导图");
+    expect(image).toHaveAttribute("src", expect.stringContaining("keyframes/KF-E1S01-guide.png"));
+  });
+
+  it("导演分镜提示词列展示动作引导图与视频起始关键帧两段提示词", () => {
+    renderDetail({
+      keyframePrompt: {
+        keyframe_id: "KF-E1S01-guide",
+        shot_id: "E1S01",
+        role: "guide_reference",
+        title: "动作引导",
+        image_role_explanation: "",
+        prompt: "九宫格动作草稿",
+        optional_reference_roles: [],
+        review_checkpoints: [],
+      },
+      startKeyframePrompt: {
+        keyframe_id: "KF-E1S01-start",
+        shot_id: "E1S01",
+        role: "start_image",
+        title: "起始关键帧",
+        image_role_explanation: "",
+        prompt: "起始画面",
+        optional_reference_roles: [],
+        review_checkpoints: [],
+      },
+      videoPrompt: {
+        video_id: "VID-E1S01",
+        shot_id: "E1S01",
+        keyframe_id: "KF-E1S01-guide",
+        title: "这一镜视频",
+        duration_seconds: 8,
+        prompt: "动作描述",
+        start_image: "",
+        start_image_status: "missing",
+        reference_pack: { selected_images: [] },
+        optional_reference_roles: [],
+        submit_blockers: [],
+        review_checkpoints: [],
+      },
+    });
+
+    expect(screen.getByText("9宫格动作引导图提示词")).toBeInTheDocument();
+    expect(screen.getByText("视频起始关键帧提示词")).toBeInTheDocument();
+    expect(screen.getByText("视频提示词")).toBeInTheDocument();
+    expect(screen.getByText("本次提交给视频模型的素材参考图")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("九宫格动作草稿")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("起始画面")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("动作描述")).toBeInTheDocument();
+  });
 });

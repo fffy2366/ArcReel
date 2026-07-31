@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 PROJECT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9-]+$")
 PROJECT_SLUG_SANITIZER = re.compile(r"[^a-zA-Z0-9]+")
 
-_VALID_GENERATION_MODES = {"storyboard", "grid", "reference_video"}
+_VALID_GENERATION_MODES = {"storyboard", "director_storyboard", "grid", "reference_video"}
 _DEFAULT_GENERATION_MODE = "storyboard"
 
 # 源文件性质（source_kind）：与 content_mode / generation_mode 正交的第三轴，project.json

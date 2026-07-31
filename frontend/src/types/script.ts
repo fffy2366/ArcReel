@@ -182,6 +182,40 @@ export interface VideoPrompt {
   dialogue: Dialogue[];
 }
 
+export interface VideoGenerationInputs {
+  video_prompt?: string;
+  start_image?: string | null;
+  end_image?: string | null;
+  reference_images?: string[];
+  reference_videos?: string[];
+  reference_audios?: string[];
+  reference_pack?: Record<string, unknown> | null;
+  duration_seconds?: number | string | null;
+  actual_duration_seconds?: number | string | null;
+  aspect_ratio?: string | null;
+  resolution?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  generate_audio?: boolean | null;
+  video_clip?: string | null;
+  video_uri?: string | null;
+  video_thumbnail?: string;
+  upstream_request_preview?: {
+    model?: string | null;
+    prompt?: string | null;
+    metadata?: {
+      ratio?: string | null;
+      resolution?: string | null;
+      duration?: number | string | null;
+      images?: Array<{ url?: string | null; role?: string | null }>;
+      videos?: Array<{ url?: string | null; role?: string | null }>;
+      audios?: Array<{ url?: string | null; role?: string | null }>;
+      [key: string]: unknown;
+    } | null;
+    [key: string]: unknown;
+  } | null;
+}
+
 export interface GeneratedAssets {
   storyboard_image: string | null;
   storyboard_last_image: string | null;  // grid mode last frame

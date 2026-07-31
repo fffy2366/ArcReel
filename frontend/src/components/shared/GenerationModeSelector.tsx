@@ -14,7 +14,7 @@ export interface GenerationModeSelectorProps {
 
 const EMPTY_DISABLED: readonly GenerationMode[] = Object.freeze([]);
 
-const MODES = ["storyboard", "reference_video", "grid"] as const satisfies readonly GenerationMode[];
+const MODES = ["storyboard", "director_storyboard", "reference_video", "grid"] as const satisfies readonly GenerationMode[];
 
 export function GenerationModeSelector({
   value,
@@ -28,16 +28,20 @@ export function GenerationModeSelector({
   const labelFor = (m: GenerationMode): string =>
     m === "storyboard"
       ? t("mode_storyboard")
-      : m === "grid"
-        ? t("mode_grid")
-        : t("mode_reference_video");
+    : m === "director_storyboard"
+      ? t("mode_director_storyboard")
+    : m === "grid"
+      ? t("mode_grid")
+      : t("mode_reference_video");
 
   const descFor = (m: GenerationMode): string =>
     m === "storyboard"
       ? t("mode_storyboard_desc")
-      : m === "grid"
-        ? t("mode_grid_desc")
-        : t("mode_reference_video_desc");
+    : m === "director_storyboard"
+      ? t("mode_director_storyboard_desc")
+    : m === "grid"
+      ? t("mode_grid_desc")
+      : t("mode_reference_video_desc");
 
   return (
     <div className="space-y-2">

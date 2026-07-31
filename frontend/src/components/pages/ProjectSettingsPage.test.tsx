@@ -273,6 +273,46 @@ describe("ProjectSettingsPage – style picker", () => {
     const saveBtn = screen.getByRole("button", { name: /^(保存|Save)$/i });
     expect(saveBtn).not.toBeDisabled();
   });
+
+  it("saves project type template changes with the main settings form", async () => {
+    vi.spyOn(API, "getProject").mockResolvedValue({
+      project: {
+        title: "Demo",
+        project_type: "",
+        content_mode: "narration",
+        episodes: [],
+        characters: {},
+        clues: {},
+      },
+      scripts: {},
+    } as unknown as Awaited<ReturnType<typeof API.getProject>>);
+    const updateSpy = vi.spyOn(API, "updateProject").mockResolvedValue({
+      success: true,
+      project: { title: "Demo", project_type: "interactive_drama_game" } as unknown as Awaited<ReturnType<typeof API.updateProject>>["project"],
+    });
+
+    renderAt("/app/projects/demo/settings");
+
+    let storyGameRadio: HTMLElement | undefined;
+    await waitFor(() => {
+      storyGameRadio = screen
+        .getAllByRole("radio")
+        .find((input) => (input as HTMLInputElement).value === "interactive_drama_game");
+      expect(storyGameRadio).toBeDefined();
+    });
+    if (!storyGameRadio) throw new Error("project type radio not found");
+    fireEvent.click(storyGameRadio);
+
+    const saveBtn = screen.getByRole("button", { name: /^(保存|Save)$/i });
+    fireEvent.click(saveBtn);
+
+    await waitFor(() => {
+      expect(updateSpy).toHaveBeenCalledWith(
+        "demo",
+        expect.objectContaining({ project_type: "interactive_drama_game" }),
+      );
+    });
+  });
 });
 
 describe("ProjectSettingsPage – model_settings resolution", () => {

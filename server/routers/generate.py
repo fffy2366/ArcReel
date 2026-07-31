@@ -10,6 +10,9 @@
 """
 
 import asyncio
+import json
+from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -22,6 +25,7 @@ from lib.generation_queue_client import TaskSpec
 from lib.i18n import Translator
 from lib.path_safety import safe_exists
 from lib.project_manager import get_project_manager
+from lib.resource_paths import resource_relative_path
 from lib.script_models import get_generated_assets
 from lib.storyboard_sequence import (
     find_storyboard_item,
@@ -29,6 +33,7 @@ from lib.storyboard_sequence import (
     resolve_storyboard_image_ref,
 )
 from server.auth import CurrentUser
+from server.services.draft_video_qa import build_draft_video_repair_payload
 from server.services.image_edit_tasks import EDITABLE_RESOURCE_TYPES, resolve_current_image_rel
 
 router = APIRouter()
@@ -73,6 +78,120 @@ class EditImageRequest(BaseModel):
     resource_id: str
     instruction: str
     script_file: str | None = None
+
+
+class GenerateKeyframeRequest(BaseModel):
+    prompt: str
+    negative_prompt: str | None = None
+    episode: int
+    shot_id: str | None = None
+    role: str = "start_image"
+    reference_images: list[str] | None = None
+
+
+class GenerateDraftVideoRequest(BaseModel):
+    prompt: str
+    episode: int
+    duration_seconds: int | None = None
+    start_image: str | None = None
+    reference_pack: dict | None = None
+    reference_images: list[str] | None = None
+    reference_videos: list[str] | None = None
+    reference_audios: list[str] | None = None
+    seed: int | None = None
+
+
+class RepairDraftVideoRequest(BaseModel):
+    episode: int
+    seed: int | None = None
+
+
+def _drafts_path(project_path: Path, episode: int, filename: str) -> Path:
+    return project_path / "drafts" / f"episode_{episode}" / filename
+
+
+def _find_keyframe_prompt(project_path: Path, episode: int, keyframe_id: str, _t: Translator) -> dict:
+    path = _drafts_path(project_path, episode, "keyframe_prompts.json")
+    if not path.exists():
+        raise NotFoundError("draft_file_not_found")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for item in payload.get("prompts") or []:
+        if str(item.get("keyframe_id") or "") == keyframe_id:
+            return item
+    raise NotFoundError("keyframe_not_found", keyframe_id=keyframe_id)
+
+
+def _find_video_prompt(project_path: Path, episode: int, video_id: str) -> dict:
+    path = _drafts_path(project_path, episode, "video_prompts.json")
+    if not path.exists():
+        raise NotFoundError("draft_file_not_found")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for item in payload.get("videos") or []:
+        if str(item.get("video_id") or "") == video_id:
+            return item
+    raise NotFoundError("draft_video_not_found", video_id=video_id)
+
+
+def _find_director_shot(project_path: Path, episode: int, shot_id: str) -> dict | None:
+    if not shot_id:
+        return None
+    path = _drafts_path(project_path, episode, "director_shots.json")
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for group in payload.get("shot_groups") or []:
+        for shot in group.get("shots") or []:
+            if str(shot.get("shot_id") or "") == shot_id:
+                return shot
+    return None
+
+
+def _find_draft_video_qa_item(project_path: Path, episode: int, video_id: str) -> dict:
+    path = _drafts_path(project_path, episode, "draft_video_qa.json")
+    if not path.exists():
+        raise NotFoundError("draft_file_not_found")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for item in payload.get("items") or []:
+        if str(item.get("video_id") or "") == video_id:
+            return item
+    raise NotFoundError("draft_video_not_found", video_id=video_id)
+
+
+def _resolve_project_file_path(project_path: Path, rel_path: str, *, field_name: str) -> Path:
+    raw = str(rel_path or "").strip()
+    if not raw:
+        raise BadRequestError("draft_video_blocked", video_id=field_name, reason=f"{field_name} is empty")
+    resolved = (project_path / raw).resolve()
+    try:
+        resolved.relative_to(project_path.resolve())
+    except ValueError:
+        raise BadRequestError("draft_video_blocked", video_id=field_name, reason=f"{field_name} must be inside project")
+    return resolved
+
+
+def _with_existing_motion_guide_reference(project_path: Path, reference_pack: Any, keyframe_id: str) -> dict[str, Any]:
+    pack = dict(reference_pack) if isinstance(reference_pack, dict) else {}
+    selected_images = list(pack.get("selected_images")) if isinstance(pack.get("selected_images"), list) else []
+    guide_path = resource_relative_path("keyframe", keyframe_id)
+    if guide_path and (project_path / guide_path).exists():
+        seen_paths = {
+            str(entry.get("path") or "")
+            for entry in selected_images
+            if isinstance(entry, dict) and str(entry.get("path") or "")
+        }
+        if guide_path not in seen_paths:
+            selected_images.insert(
+                0,
+                {
+                    "role": "motion_guide_grid",
+                    "path": guide_path,
+                    "submit_as": "reference_image",
+                    "required": False,
+                    "status": "ready",
+                },
+            )
+    pack["selected_images"] = selected_images[:9]
+    return pack
 
 
 # ==================== 分镜图生成 ====================
@@ -211,6 +330,174 @@ async def generate_video(
         "task_id": result["task_id"],
         "deduped": result.get("deduped", False),
         "message": _t("video_task_submitted", segment_id=segment_id),
+    }
+
+
+@router.post("/projects/{project_name}/generate/keyframe/{keyframe_id}")
+async def generate_keyframe(
+    project_name: str,
+    keyframe_id: str,
+    req: GenerateKeyframeRequest,
+    _user: CurrentUser,
+    _t: Translator,
+):
+    """提交导演分镜关键帧生成任务到队列。"""
+
+    def _sync():
+        project = get_project_manager().load_project(project_name)
+        project_path = get_project_manager().get_project_path(project_name)
+        item = _find_keyframe_prompt(project_path, req.episode, keyframe_id, _t)
+        if str(item.get("role") or "") == "review_frame":
+            raise BadRequestError("keyframe_review_frame_not_generatable", keyframe_id=keyframe_id)
+        return project, item
+
+    project, prompt_item = await asyncio.to_thread(_sync)
+    prompt = req.prompt.strip() or str(prompt_item.get("prompt") or "").strip()
+    if not prompt:
+        raise BadRequestError("prompt_text_empty")
+
+    spec = TaskSpec.from_request(
+        task_type="keyframe",
+        media_type="image",
+        resource_id=keyframe_id,
+        prompt=prompt,
+        extra_payload={
+            "negative_prompt": req.negative_prompt or prompt_item.get("negative_prompt") or "",
+            "episode": req.episode,
+            "shot_id": req.shot_id or prompt_item.get("shot_id"),
+            "role": req.role or prompt_item.get("role") or "start_image",
+            "reference_images": req.reference_images,
+        },
+    )
+    queue = get_generation_queue()
+    result = await queue.enqueue_task(
+        project_name=project_name,
+        task_type=spec.task_type,
+        media_type=spec.media_type,
+        resource_id=spec.resource_id,
+        payload=spec.payload,
+        source="webui",
+        user_id=_user.id,
+    )
+    return {
+        "success": True,
+        "task_id": result["task_id"],
+        "deduped": result.get("deduped", False),
+        "message": _t("keyframe_task_submitted", keyframe_id=keyframe_id),
+    }
+
+
+@router.post("/projects/{project_name}/generate/draft-video/{video_id}")
+async def generate_draft_video(
+    project_name: str,
+    video_id: str,
+    req: GenerateDraftVideoRequest,
+    _user: CurrentUser,
+    _t: Translator,
+):
+    """提交导演分镜草稿视频生成任务到队列。"""
+
+    def _sync():
+        get_project_manager().load_project(project_name)
+        project_path = get_project_manager().get_project_path(project_name)
+        item = _find_video_prompt(project_path, req.episode, video_id)
+        blockers = [str(blocker) for blocker in item.get("submit_blockers") or [] if str(blocker)]
+        if blockers:
+            raise BadRequestError("draft_video_blocked", video_id=video_id, reason=", ".join(blockers))
+        start_image = req.start_image or item.get("start_image")
+        if start_image:
+            start_image_path = _resolve_project_file_path(project_path, start_image, field_name="start_image")
+            if not start_image_path.exists():
+                raise BadRequestError("draft_video_blocked", video_id=video_id, reason="start_image_missing")
+        reference_pack = (
+            req.reference_pack
+            if req.reference_pack is not None
+            else _with_existing_motion_guide_reference(project_path, item.get("reference_pack"), str(item.get("keyframe_id") or ""))
+        )
+        return item, start_image, reference_pack
+
+    prompt_item, start_image, reference_pack = await asyncio.to_thread(_sync)
+    prompt = req.prompt.strip()
+    if not prompt:
+        raise BadRequestError("prompt_text_empty")
+
+    spec = TaskSpec.from_request(
+        task_type="draft_video",
+        media_type="video",
+        resource_id=video_id,
+        prompt=prompt,
+        extra_payload={
+            "episode": req.episode,
+            "duration_seconds": req.duration_seconds or prompt_item.get("duration_seconds"),
+            "start_image": start_image,
+            "reference_pack": reference_pack,
+            "reference_images": req.reference_images,
+            "reference_videos": req.reference_videos,
+            "reference_audios": req.reference_audios,
+            "seed": req.seed,
+        },
+    )
+    queue = get_generation_queue()
+    result = await queue.enqueue_task(
+        project_name=project_name,
+        task_type=spec.task_type,
+        media_type=spec.media_type,
+        resource_id=spec.resource_id,
+        payload=spec.payload,
+        source="webui",
+        user_id=_user.id,
+    )
+    return {
+        "success": True,
+        "task_id": result["task_id"],
+        "deduped": result.get("deduped", False),
+        "message": _t("draft_video_task_submitted", video_id=video_id),
+    }
+
+
+@router.post("/projects/{project_name}/generate/draft-video/{video_id}/repair")
+async def repair_draft_video(
+    project_name: str,
+    video_id: str,
+    req: RepairDraftVideoRequest,
+    _user: CurrentUser,
+    _t: Translator,
+):
+    """根据 QA 结果提交草稿视频修复任务。"""
+
+    def _sync():
+        project = get_project_manager().load_project(project_name)
+        project_path = get_project_manager().get_project_path(project_name)
+        video_prompt = _find_video_prompt(project_path, req.episode, video_id)
+        qa_item = _find_draft_video_qa_item(project_path, req.episode, video_id)
+        if str(qa_item.get("status") or "") != "needs_fix":
+            raise BadRequestError("draft_video_repair_not_needed", video_id=video_id)
+        shot = _find_director_shot(project_path, req.episode, str(video_prompt.get("shot_id") or ""))
+        return build_draft_video_repair_payload(
+            video_prompt,
+            qa_item,
+            project=project,
+            project_path=project_path,
+            shot=shot,
+        )
+
+    repair_payload = await asyncio.to_thread(_sync)
+    repair_payload["seed"] = req.seed
+    queue = get_generation_queue()
+    result = await queue.enqueue_task(
+        project_name=project_name,
+        task_type="draft_video",
+        media_type="video",
+        resource_id=video_id,
+        payload=repair_payload,
+        source="webui",
+        user_id=_user.id,
+    )
+    return {
+        "success": True,
+        "task_id": result["task_id"],
+        "deduped": result.get("deduped", False),
+        "message": _t("draft_video_repair_task_submitted", video_id=video_id),
     }
 
 

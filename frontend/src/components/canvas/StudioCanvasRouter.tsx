@@ -31,6 +31,7 @@ import { ProductsPage } from "./lorebook/ProductsPage";
 import { ReferenceVideoCanvas } from "./reference/ReferenceVideoCanvas";
 import { AdReferenceVideoCanvas } from "./reference/AdReferenceVideoCanvas";
 import { GridImageToVideoCanvas } from "./grid/GridImageToVideoCanvas";
+import { PreprocessingView } from "./timeline/PreprocessingView";
 import { EpisodeSourceReview } from "./EpisodeSourceReview";
 import { API } from "@/api";
 import {
@@ -724,6 +725,38 @@ export function StudioCanvasRouter() {
                     onSaveTitle={(title) => handleUpdateEpisodeTitle(epNum, title)}
                     canEditTitle={Boolean(episode?.script_file)}
                     hasScript={Boolean(script)}
+                  />
+                ) : mode === "director_storyboard" ? (
+                  <TimelineCanvas
+                    key={`${currentProjectName}::${epNum}::director_storyboard`}
+                    projectName={currentProjectName}
+                    episode={epNum}
+                    episodeTitle={episode?.title}
+                    onSaveTitle={(title) => handleUpdateEpisodeTitle(epNum, title)}
+                    canEditTitle={Boolean(episode?.script_file)}
+                    hasDraft={hasDraft}
+                    episodeScript={script}
+                    scriptFile={scriptFile ?? undefined}
+                    projectData={currentProjectData}
+                    durationOptions={durationOptions}
+                    durationWarningReason={durationWarningReason}
+                    onUpdatePrompt={awaitedUpdatePrompt}
+                    onGenerateStoryboard={voidPromise(handleGenerateStoryboard)}
+                    onGenerateVideo={voidPromise(handleGenerateVideo)}
+                    onGenerateNarration={voidPromise(handleGenerateNarration)}
+                    onGenerateEpisodeNarration={voidPromise(handleGenerateEpisodeNarration)}
+                    onRestoreStoryboard={handleRestoreAsset}
+                    onRestoreVideo={handleRestoreAsset}
+                    preprocessingView={
+                      <div className="h-full overflow-y-auto p-4">
+                        <PreprocessingView
+                          projectName={currentProjectName}
+                          episode={epNum}
+                          contentMode={currentProjectData?.content_mode === "drama" ? "drama" : "narration"}
+                          compact
+                        />
+                      </div>
+                    }
                   />
                 ) : mode === "grid" ? (
                   <GridImageToVideoCanvas

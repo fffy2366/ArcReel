@@ -729,6 +729,17 @@ class AssistantService:
         "generate-narration-audio": "audio-lines",
         "generate-assets": "users",
         "compose-video": "scissors",
+        # Added from PlayAsLife v0.5.3-0.4 novel-to-video pipeline skills:
+        "continuity-qa": "check-circle",
+        "frontend-design": "smartphone",
+        "keyframe-prompt": "layout-grid",
+        "reference-pack": "archive",
+        "seedance-video-prompt-optimizer": "sparkles",
+        "shot-director": "film",
+        "story-beat": "list",
+        "story-game-workflow": "gamepad",
+        "text-to-image-prompt": "image",
+        "video-prompt": "video",
     }
 
     def list_available_skills(self, project_name: str | None = None) -> list[dict[str, str]]:

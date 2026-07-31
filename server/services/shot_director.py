@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from lib.text_backends.base import TextGenerationRequest, TextTaskType
 from lib.text_generator import TextGenerator
 from lib.video_duration import MIN_VIDEO_DURATION_SECONDS, coerce_video_duration
+from server.services.preprocessing_model_config import env_int
 from server.services.project_type_templates import (
     CONTENT_FORMAT_AD,
     CONTENT_FORMAT_INTERACTIVE,
@@ -32,7 +33,8 @@ from server.services.text_model_json import parse_model_json_object
 
 logger = logging.getLogger(__name__)
 
-DIRECTOR_SHOT_MODEL_TIMEOUT_SECONDS = 25
+DIRECTOR_SHOT_MODEL_TIMEOUT_SECONDS = env_int("ARCREEL_DIRECTOR_SHOT_MODEL_TIMEOUT_SECONDS", 90)
+DIRECTOR_SHOT_MODEL_MAX_OUTPUT_TOKENS = env_int("ARCREEL_DIRECTOR_SHOT_MODEL_MAX_OUTPUT_TOKENS", 6000)
 DIRECTOR_SHOT_MODEL_FAILURE_BREAKER = 1
 MAX_SINGLE_SHOT_DURATION_SECONDS = 15
 
@@ -1012,7 +1014,7 @@ async def build_director_shot_plan_from_story_beats_with_text_model(
     try:
         generator = await TextGenerator.create(TextTaskType.DIRECTOR_SHOTS, project_name=project_name)
     except Exception as exc:
-        logger.warning("导演分镜文本模型初始化失败，回退到规则模板: %s", exc)
+        logger.warning("导演分镜文本模型初始化失败，回退到规则模板: %r", exc)
         return fallback
 
     merged_groups: list[dict[str, Any]] = []
@@ -1033,7 +1035,7 @@ async def build_director_shot_plan_from_story_beats_with_text_model(
                     TextGenerationRequest(
                         system_prompt=_director_system_prompt(),
                         prompt=_director_user_prompt(batch),
-                        max_output_tokens=3000,
+                        max_output_tokens=DIRECTOR_SHOT_MODEL_MAX_OUTPUT_TOKENS,
                     ),
                     project_name=project_name,
                 ),
@@ -1046,7 +1048,7 @@ async def build_director_shot_plan_from_story_beats_with_text_model(
             merged_groups.extend(batch_plan.get("shot_groups") or [])
             consecutive_failures = 0
         except Exception as exc:
-            logger.warning("导演分镜第 %s 批文本模型生成失败，回退该批规则模板: %s", batch_index, exc)
+            logger.warning("导演分镜第 %s 批文本模型生成失败，回退该批规则模板: %r", batch_index, exc)
             consecutive_failures += 1
             fallback_group = fallback_groups[batch_index - 1] if batch_index - 1 < len(fallback_groups) else None
             if fallback_group:
