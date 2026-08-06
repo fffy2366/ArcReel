@@ -76,6 +76,24 @@ SDK_AVAILABLE = True
 _INBOX_BACKLOG_WARN_THRESHOLD = 100
 _INBOX_BACKLOG_RESET_THRESHOLD = 50  # 降至此水位以下才重置告警状态，避免抖动刷屏
 
+# 自治回合活动信号：这些消息只在模型回合进行中产出。idle/completed 状态下
+# 观察到它们，说明 CLI 自主开启了新回合（异步子代理完成注入 task-notification
+# 后自跑的 turn）——必须立刻把会话翻回 running 并撤销闲置清理，否则清理
+# 定时器会在回合进行中途按 idle 误杀 CLI 进程，通知连同回合一起丢失。
+_TURN_ACTIVITY_MESSAGE_TYPES = frozenset({"assistant", "user", "stream_event"})
+_TURN_ACTIVITY_SYSTEM_SUBTYPES = frozenset({"task_started", "task_progress", "task_notification"})
+
+
+def _is_turn_activity(msg_dict: dict[str, Any]) -> bool:
+    """判定消息是否属于某个模型回合的产出（区别于连接初始化等带外消息）。"""
+    msg_type = msg_dict.get("type")
+    if msg_type in _TURN_ACTIVITY_MESSAGE_TYPES:
+        # SDK 回放的用户消息副本属于既有回合的回声，不是新回合信号
+        return not msg_dict.get(REPLAYED_USER_ECHO_KEY)
+    if msg_type == "system":
+        return msg_dict.get("subtype") in _TURN_ACTIVITY_SYSTEM_SUBTYPES
+    return False
+
 
 class _StartupStderrCollector:
     """在 sdk_session_id 就绪前无损收集 stderr，随后停止并释放。"""
@@ -236,7 +254,8 @@ class ManagedSession:
     def _on_actor_message(self, msg: dict[str, Any]) -> None:
         """SessionActor 的 on_message 回调。同步，内存操作，不 await。
 
-        职责：向订阅者广播消息。
+        职责：向订阅者广播消息，并刷新 last_activity（收消息也是活跃证据，
+        巡检/清理定时器据此判断闲置——自治回合产出期间不得被视为 idle）。
 
         **状态转换不在此处做**——managed.status 由 _finalize_turn 在异步路径中
         统一设置。若在此提前切换为 idle/completed，`send_message` 的并发保护
@@ -245,10 +264,11 @@ class ManagedSession:
 
         pending_questions 注册由 SessionManager._handle_special_message 处理。
         """
+        self.last_activity = time.monotonic()
         self.channel.broadcast(msg)
 
     async def send_query(self, prompt: str | AsyncIterable[dict], sdk_session_id: str = "default") -> None:
-        """将 prompt 送入 SDK 后立即返回；整轮 receive_response 由 actor 后台 drain。
+        """将 prompt 送入 SDK 后立即返回；整轮响应由 actor 的持久消息泵在后台消费。
 
         只等 `cmd.sent`（prompt 已进 SDK）而非 `cmd.done`（整轮结束），以保持
         `/sessions/send` 原有的 "立即 accepted + SSE 异步消费" 语义。
@@ -786,6 +806,22 @@ class SessionManager:
                     )
                 elif managed._inbox_warned and depth <= _INBOX_BACKLOG_RESET_THRESHOLD:
                     managed._inbox_warned = False
+                # 自治回合起步保护：idle 期间观察到回合活动消息（如异步子代理
+                # 完成的 task-notification 触发的 turn），立即翻回 running 并撤销
+                # 闲置清理定时器。inbox 是 FIFO，本翻转必然排在上一回合 result 的
+                # _finalize_turn 之后，顺序安全。
+                if managed.status in ("idle", "completed", "interrupted") and _is_turn_activity(msg_dict):
+                    managed.status = "running"
+                    if managed._cleanup_task is not None and not managed._cleanup_task.done():
+                        managed._cleanup_task.cancel()
+                        managed._cleanup_task = None
+                    try:
+                        await self.meta_store.update_status(managed.session_id, "running")
+                    except Exception:
+                        logger.exception(
+                            "自治回合状态持久化失败 session_id=%s",
+                            managed.session_id,
+                        )
                 # Short-circuit once sdk_session_id is captured: stream_event
                 # messages can be very high-frequency and _extract_sdk_session_id
                 # only yields on the init system message.

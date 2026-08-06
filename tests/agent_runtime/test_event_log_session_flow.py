@@ -134,6 +134,7 @@ class _InterruptingClient(FakeSDKClient):
             await self._pending_messages.put(
                 {"type": "user", "content": "[Request interrupted by user]", "uuid": "sdk-echo-1", "session_id": SDK_ID}
             )
+        # 真实 CLI 在 interrupt 后产出 result 但消息流存续（会话未死），不注入 None
         await self._pending_messages.put(
             {
                 "type": "result",
@@ -143,7 +144,6 @@ class _InterruptingClient(FakeSDKClient):
                 "session_id": SDK_ID,
             }
         )
-        await self._pending_messages.put(None)
 
 
 class _CrashBeforeInitClient(FakeSDKClient):
@@ -151,8 +151,8 @@ class _CrashBeforeInitClient(FakeSDKClient):
         super().__init__()
         self._stderr_callback = stderr_callback
 
-    async def receive_response(self):
-        self._record("receive_response")
+    async def receive_messages(self):
+        self._record("receive_messages")
         if self._stderr_callback is not None:
             self._stderr_callback("OPENAI_API_KEY=pre-init-secret\nprovider stderr detail")
         if False:
@@ -418,6 +418,73 @@ class TestNewSessionEventLogFlow:
             assert entries[1]["subtype"] == "interrupt"
         finally:
             await manager.close_session(SDK_ID)
+
+    async def test_autonomous_task_notification_turn_after_idle_is_observed_and_finalized(
+        self, manager: SessionManager
+    ):
+        """回归：回合结束（idle）后 CLI 自主开启的 task-notification turn 必须——
+        1) 消息被消费并写入事件日志（旧实现只在 query 期间读流，通知静默丢失）；
+        2) 会话翻回 running（idle 清理定时器不会在自治回合进行中途误杀 CLI）；
+        3) 自治回合的 result 把会话 finalize 回终态。
+        """
+        client = FakeSDKClient(messages=_new_session_messages())
+        fake_options = SimpleNamespace(env=None)
+
+        with (
+            patch.object(manager, "_build_options", new=AsyncMock(return_value=fake_options)),
+            patch("server.agent_runtime.session_manager.ClaudeSDKClient", lambda options: client),
+            patch("server.agent_runtime.session_manager.tag_session", None),
+        ):
+            sdk_id = await manager.send_new_session(
+                "demo",
+                "帮我写分镜",
+                user_entry=build_user_entry([{"type": "text", "text": "帮我写分镜"}]),
+                client_key="ck-autonomous",
+            )
+
+        try:
+            # 首个回合 finalize 到终态
+            await _wait_for_status(manager, sdk_id, "completed")
+
+            # CLI 侧自治回合开始：注入 task-notification 用户消息
+            client.push_message(
+                {
+                    "type": "user",
+                    "content": (
+                        "<task-notification>\n<task-id>agent-abc123</task-id>\n"
+                        "<tool-use-id>tu-async-1</tool-use-id>\n<status>completed</status>\n"
+                        "<summary>子代理完成</summary>\n</task-notification>"
+                    ),
+                    "uuid": "sdk-tn-1",
+                    "session_id": SDK_ID,
+                }
+            )
+            # 自治回合活动必须把 idle 会话翻回 running
+            await _wait_for_status(manager, sdk_id, "running")
+
+            # 自治回合的后续产出与 result
+            client.push_message(
+                {
+                    "type": "assistant",
+                    "message_id": "msg_auto",
+                    "uuid": "a-auto",
+                    "session_id": SDK_ID,
+                    "content": [{"type": "text", "text": "子代理已完成，结果如下"}],
+                }
+            )
+            client.push_message(
+                {"type": "result", "subtype": "success", "is_error": False, "session_id": SDK_ID, "uuid": "r-auto"}
+            )
+            await _wait_for_status(manager, sdk_id, "completed")
+
+            # 事件日志：task_notification 系统条目 + 自治回合的 assistant 条目都落库
+            entries = await manager.event_log_store.list_after(sdk_id)
+            notification_entries = [e for e in entries if e.get("subtype") == "task_notification"]
+            assert len(notification_entries) == 1
+            assert notification_entries[0]["task_id"] == "agent-abc123"
+            assert any(e.get("message_id") == "msg_auto" for e in entries)
+        finally:
+            await manager.close_session(sdk_id)
 
     async def test_ask_user_question_flow_produces_question_and_answer_entries(self, manager: SessionManager):
         """AskUserQuestion 提问（assistant tool_use）与答复（typed 答复条目）都出现在日志。"""

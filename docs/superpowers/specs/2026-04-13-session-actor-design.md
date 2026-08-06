@@ -529,3 +529,16 @@ async def answer_user_question(
 | `server/agent_runtime/session_store.py` | 不变 |
 | `server/routers/assistant.py` | 不变 |
 | 前端 | 不变 |
+
+## 12. 修订（2026-08-06）：持久消息泵取代按 query 的 receive_response
+
+**问题**：CLI 会在异步子代理（Task）完成时自行注入 task-notification 并**自主开启新回合**。旧实现只在 query 期间通过 `receive_response()` 读流，回合一结束actor 就停读——自治回合的消息堆积在 SDK 内部缓冲无人消费：事件日志 / SSE 完全无感知（用户看到"subagent 没有返回内容"），且 `last_activity` 不刷新，idle 清理定时器（默认 300s）会在自治回合进行中途按闲置误杀 CLI 进程，通知连同回合一起丢失。
+
+**改动**：
+
+- `SessionActor._command_loop` 改为**单一持久** `receive_messages()` 迭代器 + 命令队列的统一 `asyncio.wait(FIRST_COMPLETED)` 交织循环；回合边界以 result 消息判定（`_is_result_message`），不再依赖迭代器终结。自治回合的消息由此被持续消费、广播并进入事件日志。
+- 消息流在非 disconnect 路径下终结（CLI 进程死亡/被误杀）按致命错误处理（`_MessageStreamEnded`），会话进入 error 终态——旧行为是下一条 query 无声空转。
+- `SessionManager._process_inbox` 新增自治回合起步保护：idle/completed/interrupted 状态下观察到回合活动消息（assistant / user / stream_event / task_* 系统消息，排除回放副本）立即翻回 `running` 并撤销闲置清理定时器；`_on_actor_message` 现在每次收消息都刷新 `last_activity`。
+- `tests/fakes.py`：`FakeSDKClient` 新增 `receive_messages()` 持久流；初始消息延迟到首次 `query()` 释放（匹配真实 CLI "有 prompt 才有产出"时序）；`interrupt()` 注入 result 但不再终结消息流（真实 CLI 中断后会话存续）。
+
+回归测试：`tests/test_session_actor.py::test_autonomous_turn_messages_after_query_drain`、`test_stream_end_without_disconnect_is_fatal`、`tests/agent_runtime/test_event_log_session_flow.py::test_autonomous_task_notification_turn_after_idle_is_observed_and_finalized`。

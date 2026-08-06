@@ -15,10 +15,14 @@ class FakeSDKClient:
     支持：
     - `async with`：`__aenter__` 记录 connect 的 current_task，`__aexit__` 记录 disconnect
     - `method_tasks`: dict[str, list[asyncio.Task]] 记录每个方法被调用时的 task
-    - `messages` 初始化参数：`receive_response` 依次 yield 的初始消息
-    - `receive_response` 默认在 yield `type="result"` 后结束；
-    - `block_forever=True` 时，仅在 `interrupt()` 注入 None sentinel 后才结束（用于测试 interrupt 中断 query 的场景）
-    - `interrupt_message`：`interrupt()` 被调用时注入给 `receive_response` 的最后一条消息
+    - `messages` 初始化参数：首个回合的消息，在**首次 `query()` 时**释放（匹配真实
+      CLI "有 prompt 才有产出"的时序；SessionActor 的持久消息泵从 connect 起就在读流）
+    - `receive_messages`：持久消息流（SessionActor 使用），仅在 None sentinel 时终结；
+      回合边界由 `type="result"` 消息表达，流本身跨回合存续
+    - `receive_response`：旧式每回合迭代器，yield `type="result"` 后结束
+      （`block_forever=True` 时仅在 None sentinel 后结束），仅保留给直接消费 fake 的测试
+    - `interrupt_message`：`interrupt()` 被调用时注入消息流的消息（通常是
+      error_during_execution 的 result）；interrupt 不再终结消息流
     - `connect_error`：`__aenter__` 时抛出的异常，用于模拟连接失败
     """
 
@@ -31,6 +35,7 @@ class FakeSDKClient:
         connect_error: Exception | None = None,
     ):
         self._initial_messages = list(messages) if messages else []
+        self._initial_released = False
         self._block_forever = block_forever
         self._interrupt_message = interrupt_message
         self._connect_error = connect_error
@@ -43,12 +48,17 @@ class FakeSDKClient:
     def _record(self, method: str) -> None:
         self.method_tasks.setdefault(method, []).append(asyncio.current_task())
 
+    async def _release_initial_messages(self) -> None:
+        if self._initial_released:
+            return
+        self._initial_released = True
+        for msg in self._initial_messages:
+            await self._pending_messages.put(msg)
+
     async def __aenter__(self):
         self._record("connect")
         if self._connect_error is not None:
             raise self._connect_error
-        for msg in self._initial_messages:
-            await self._pending_messages.put(msg)
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -59,14 +69,22 @@ class FakeSDKClient:
     async def query(self, prompt, session_id: str = "default") -> None:
         self._record("query")
         self.sent_queries.append(prompt)
+        await self._release_initial_messages()
 
     async def interrupt(self) -> None:
         self._record("interrupt")
         self.interrupted = True
         if self._interrupt_message is not None:
             await self._pending_messages.put(self._interrupt_message)
-        # 告知 receive_response "可以停止了"
-        await self._pending_messages.put(None)  # sentinel
+
+    async def receive_messages(self):
+        """持久消息流：跨回合持续 yield，仅在 None sentinel（流终结）时结束。"""
+        self._record("receive_messages")
+        while True:
+            msg = await self._pending_messages.get()
+            if msg is None:
+                return
+            yield msg
 
     async def receive_response(self):
         self._record("receive_response")
@@ -78,8 +96,8 @@ class FakeSDKClient:
             if msg.get("type") == "result" and not self._block_forever:
                 return
 
-    def push_message(self, msg: dict) -> None:
-        """测试辅助：运行中往消息流注入一条消息。"""
+    def push_message(self, msg: dict | None) -> None:
+        """测试辅助：运行中往消息流注入一条消息；None 表示流终结。"""
         self._pending_messages.put_nowait(msg)
 
     # 向后兼容：保留原方法签名（旧测试仍使用 `await client.connect()` / `await client.disconnect()`）

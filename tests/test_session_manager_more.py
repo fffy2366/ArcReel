@@ -26,7 +26,7 @@ class _FakeClaudeClient:
     """Minimal ClaudeSDKClient stand-in used by SessionActor.
 
     Implements the async-context-manager protocol plus the narrow surface the
-    actor touches: ``query`` / ``interrupt`` / ``receive_response``. ``connect``
+    actor touches: ``query`` / ``interrupt`` / ``receive_messages``. ``connect``
     is kept for the legacy get_or_connect path-check assertion.
     """
 
@@ -50,7 +50,9 @@ class _FakeClaudeClient:
     async def interrupt(self):
         pass
 
-    async def receive_response(self):
+    async def receive_messages(self):
+        # 持久空流：连接存续期间不产生消息、也不终结（终结会被 actor 视为致命）
+        await asyncio.Event().wait()
         if False:
             yield None
 
@@ -1282,7 +1284,9 @@ async def test_send_query_raises_on_cmd_error():
         async def interrupt(self):
             pass
 
-        async def receive_response(self):
+        async def receive_messages(self):
+            # 持久空流：连接存续期间不终结
+            await asyncio.Event().wait()
             if False:
                 yield {}
 

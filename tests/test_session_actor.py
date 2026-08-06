@@ -13,6 +13,7 @@ from server.agent_runtime.session_actor import (
     SessionActor,
     SessionCommand,
     _ActorClosed,
+    _MessageStreamEnded,
 )
 from tests.fakes import FakeSDKClient
 
@@ -71,13 +72,15 @@ async def test_fake_client_yields_injected_messages_then_stops():
     ]
     client = FakeSDKClient(messages=messages)
     async with client:
+        # 初始消息在首次 query 时释放（匹配真实 CLI 时序）
+        await client.query("go")
         collected = [msg async for msg in client.receive_response()]
     assert collected == messages
 
 
 @pytest.mark.asyncio
 async def test_fake_client_receive_response_blocks_until_interrupt():
-    # block_forever=True 时，receive_response 只在 interrupt 注入 message 后才结束
+    # block_forever=True 时，receive_response 只在 None sentinel 后结束
     client = FakeSDKClient(
         block_forever=True,
         interrupt_message={"type": "result", "subtype": "error_during_execution"},
@@ -86,7 +89,8 @@ async def test_fake_client_receive_response_blocks_until_interrupt():
         recv_task = asyncio.create_task(_collect(client))
         await asyncio.sleep(0.05)
         assert not recv_task.done()  # 仍在阻塞
-        await client.interrupt()
+        await client.interrupt()  # 注入 result 消息（interrupt 不再终结消息流）
+        client.push_message(None)  # 显式终结流
         collected = await asyncio.wait_for(recv_task, timeout=1.0)
     assert collected == [{"type": "result", "subtype": "error_during_execution"}]
 
@@ -311,11 +315,8 @@ async def test_two_queries_queued_during_interrupt_drain():
     # q1 先完成（drain 到 error_during_execution）
     await q1.done.wait()
 
-    # q2 要能被消费：向 client 推第二个 query 的响应
+    # q2 要能被消费：向 client 推第二个 query 的响应（result 即回合边界）
     client.push_message({"type": "result", "subtype": "success"})
-    # block_forever=True 下需要显式 None sentinel 结束 q2 的 drain
-    client.push_message(None)
-    # interrupt 让 receive_response 卡住的协程已结束；第二次 receive_response 会从队列拿
     await asyncio.wait_for(q2.done.wait(), timeout=1.0)
 
     assert client.sent_queries == ["first", "second"]
@@ -489,8 +490,8 @@ async def test_drive_query_rejects_second_pending_query():
         # q2 仍在 pending，尚未被拒绝
         assert not q2.done.is_set()
     finally:
-        # 结束 q1，让 q2 进入执行；用 done.wait 替代 sleep 避免 CI flaky
-        client.push_message(None)  # block_forever sentinel
+        # 结束 q1（result 即回合边界），让 q2 进入执行；用 done.wait 替代 sleep 避免 CI flaky
+        client.push_message({"type": "result", "subtype": "success"})
         await asyncio.wait_for(q1.done.wait(), timeout=1.0)  # pyright: ignore[reportPossiblyUnboundVariable]
         d = SessionCommand(type="disconnect")
         await actor.enqueue(d)
@@ -511,6 +512,70 @@ async def test_start_is_not_reentrant():
         d = SessionCommand(type="disconnect")
         await actor.enqueue(d)
         await d.done.wait()
+
+
+@pytest.mark.asyncio
+async def test_autonomous_turn_messages_after_query_drain():
+    """回归：query 回合结束后（actor 无 active query），CLI 自主开启的回合
+    （异步子代理完成注入 task-notification 后自跑的 turn）产出的消息仍必须
+    被消费并回调 on_message——旧实现只在 query 期间读流，这类消息会堆积在
+    SDK 缓冲里无人感知（用户看到"subagent 没有返回内容"）。"""
+    collected: list[dict] = []
+    client = FakeSDKClient()
+    actor = SessionActor(
+        client_factory=lambda: client,
+        on_message=lambda msg: collected.append(msg),
+    )
+    await actor.start()
+    try:
+        q = SessionCommand(type="query", prompt="hi")
+        await actor.enqueue(q)
+        await q.sent.wait()
+        client.push_message({"type": "assistant", "id": 1})
+        client.push_message({"type": "result", "subtype": "success"})
+        await asyncio.wait_for(q.done.wait(), timeout=1.0)
+        assert len(collected) == 2
+
+        # 回合已结束；CLI 侧自治回合的消息继续到达
+        client.push_message({"type": "user", "message": {"content": "<task-notification>…</task-notification>"}})
+        client.push_message({"type": "assistant", "id": 2})
+        client.push_message({"type": "result", "subtype": "success"})
+        await asyncio.sleep(0.1)
+
+        assert [m.get("id") for m in collected if m.get("type") == "assistant"] == [1, 2]
+        # 无 active query 时的 result 不应崩溃，也不影响后续命令
+        d = SessionCommand(type="disconnect")
+        await actor.enqueue(d)
+        await asyncio.wait_for(d.done.wait(), timeout=1.0)
+        assert d.error is None
+    finally:
+        await actor.cancel_and_wait()
+
+
+@pytest.mark.asyncio
+async def test_stream_end_without_disconnect_is_fatal():
+    """消息流在非 disconnect 路径下终结（CLI 进程死亡/被误杀）：actor 必须
+    按致命错误退出并释放所有等待者，而不是假装闲置让下一条 query 无声失败。"""
+    client = FakeSDKClient()
+    actor = SessionActor(client_factory=lambda: client, on_message=lambda m: None)
+    await actor.start()
+
+    q = SessionCommand(type="query", prompt="hi")
+    await actor.enqueue(q)
+    await q.sent.wait()
+
+    client.push_message(None)  # 模拟 CLI 进程死亡导致流终结
+    await asyncio.wait_for(q.done.wait(), timeout=1.0)
+
+    if actor._task is not None:
+        with pytest.raises(_MessageStreamEnded):
+            await actor._task
+
+    # actor 已死亡；后续命令 fast-fail
+    stale = SessionCommand(type="query", prompt="another")
+    await actor.enqueue(stale)
+    await stale.done.wait()
+    assert stale.error is not None
 
 
 @pytest.mark.asyncio
