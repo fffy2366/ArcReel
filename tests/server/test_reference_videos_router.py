@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unicodedata
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -12,6 +13,8 @@ from fastapi.testclient import TestClient
 from server.auth import CurrentUserInfo, get_current_user
 from server.error_handlers import register_error_handlers
 from tests.auth_deps import AUTH_DEPENDENCIES
+from tests.fakes import fake_reference_request_projector
+from tests.speech_contract_cases import SPEECH_CONTRACT_CASES, SpeechContractCase
 
 
 @pytest.fixture
@@ -29,8 +32,8 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
                 "content_mode": "narration",
                 "generation_mode": "reference_video",
                 "style": "s",
-                "characters": {"张三": {"description": "x"}},
-                "scenes": {"酒馆": {"description": "x"}},
+                "characters": {"张三": {"description": "x", "character_sheet": "characters/张三.png"}},
+                "scenes": {"酒馆": {"description": "x", "scene_sheet": "scenes/酒馆.png"}},
                 "props": {},
                 "episodes": [{"episode": 1, "title": "E1", "script_file": "scripts/episode_1.json"}],
             },
@@ -38,6 +41,10 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
         ),
         encoding="utf-8",
     )
+    (proj_dir / "characters").mkdir()
+    (proj_dir / "characters" / "张三.png").write_bytes(b"image")
+    (proj_dir / "scenes").mkdir()
+    (proj_dir / "scenes" / "酒馆.png").write_bytes(b"image")
     (proj_dir / "scripts" / "episode_1.json").write_text(
         json.dumps(
             {
@@ -61,9 +68,9 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
     custom_pm = ProjectManager(projects_root)
     monkeypatch.setattr(router_mod, "get_project_manager", lambda: custom_pm)
-    # 视频桶预检需要 DB（system_settings）；router 单测无 DB，能力闸行为由
-    # test_config_resolver / test_validators_video_bucket 覆盖，这里只保 happy path 放行
-    monkeypatch.setattr(router_mod, "require_video_bucket_capability", AsyncMock(return_value=None))
+    monkeypatch.setattr(router_mod, "tts_task_in_progress", AsyncMock(return_value=False))
+    # 公共 request projection 的 resolver 需要 DB；路由测试注入 in-process 能力适配器。
+    monkeypatch.setattr(router_mod, "project_reference_unit_request", _projection_with_durations([3, 6, 9]))
 
     app = FastAPI()
     register_error_handlers(app)
@@ -103,6 +110,17 @@ def test_add_unit_creates_minimal_entry(client: TestClient):
 
 
 @pytest.mark.integration
+def test_add_unit_allows_blank_editor_draft(client: TestClient):
+    response = client.post(
+        "/api/v1/projects/demo/reference-videos/episodes/1/units",
+        json={"prompt": "", "duration_seconds": 3, "references": []},
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["unit"]["shots"] == [{"text": ""}]
+
+
+@pytest.mark.integration
 def test_add_unit_without_duration_falls_back_to_model_slot(client: TestClient, monkeypatch: pytest.MonkeyPatch):
     """请求不给时长 → 取项目能力解析出的档位首项（与执行层解析申请秒数的回退序同源）。"""
     _patch_supported_durations(monkeypatch, [6, 9])
@@ -112,6 +130,29 @@ def test_add_unit_without_duration_falls_back_to_model_slot(client: TestClient, 
     )
     assert resp.status_code == 201, resp.text
     assert resp.json()["unit"]["duration_seconds"] == 6
+
+
+@pytest.mark.integration
+def test_add_unit_derives_omitted_references_before_selecting_duration_bucket(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    """省略 references 时先从正文派生，默认时长按最终 r2v 单元定桶。"""
+    from server.routers import reference_videos as router_mod
+    from server.services.reference_video_tasks import ProjectDurationContext
+
+    ctx = ProjectDurationContext(supported_durations=(6, 9), resolution=None, provider_id="", model_name=None)
+    resolve_context = AsyncMock(return_value=ctx)
+    monkeypatch.setattr(router_mod, "resolve_project_duration_context", resolve_context)
+
+    response = client.post(
+        "/api/v1/projects/demo/reference-videos/episodes/1/units",
+        json={"prompt": "镜头1：@[张三] 推门"},
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["unit"]["references"] == [{"type": "character", "name": "张三"}]
+    assert response.json()["unit"]["duration_seconds"] == 6
+    assert resolve_context.await_args.kwargs["capability"] == "r2v"
 
 
 @pytest.mark.integration
@@ -139,6 +180,22 @@ def test_add_unit_rejects_unknown_asset_reference(client: TestClient):
     assert "未知角色" in resp.json()["detail"]
 
 
+@pytest.mark.unit
+def test_add_unit_atomically_rejects_mixed_speech(client: TestClient):
+    response = client.post(
+        "/api/v1/projects/demo/reference-videos/episodes/1/units",
+        json={
+            "prompt": "镜头1：张三推门\n@[张三]：{快走。}\n{风吹过旷野。}",
+            "duration_seconds": 3,
+            "references": [{"type": "character", "name": "张三"}],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["problems"][0]["code"] == "mixed_speech"
+    assert client.get("/api/v1/projects/demo/reference-videos/episodes/1/units").json() == {"units": []}
+
+
 def _seed_unit(client: TestClient) -> str:
     resp = client.post(
         "/api/v1/projects/demo/reference-videos/episodes/1/units",
@@ -154,18 +211,89 @@ def _seed_unit(client: TestClient) -> str:
 
 @pytest.mark.integration
 def test_patch_unit_prompt_keeps_duration(client: TestClient):
-    """时长与正文互不牵连：改文案不动 unit 时长（镜头不承载时长）。"""
+    """时长与正文互不牵连；只传正文时 references 用当前资产表重新派生。"""
     uid = _seed_unit(client)
     resp = client.patch(
         f"/api/v1/projects/demo/reference-videos/episodes/1/units/{uid}",
-        json={"prompt": "镜头1：@张三 推门\n镜头2：@酒馆 全景"},
+        json={"prompt": "镜头1：@酒馆 门口\n镜头2：@酒馆 全景"},
     )
     assert resp.status_code == 200, resp.text
     unit = resp.json()["unit"]
     assert len(unit["shots"]) == 2
     assert unit["duration_seconds"] == 3
-    # 注意：prompt 新增的 @酒馆 应由 caller 先 PATCH references 再 PATCH prompt；本端点仅按旧 references 映射
-    assert len(unit["references"]) == 1
+    assert unit["references"] == [{"type": "scene", "name": "酒馆"}]
+
+
+@pytest.mark.integration
+def test_patch_unit_rederives_non_character_references_before_speech_admission(client: TestClient):
+    uid = _seed_unit(client)
+
+    response = client.patch(
+        f"/api/v1/projects/demo/reference-videos/episodes/1/units/{uid}",
+        json={"prompt": "镜头1：@[酒馆]：木门被风吹开"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["unit"]["references"] == [{"type": "scene", "name": "酒馆"}]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "case",
+    [case for case in SPEECH_CONTRACT_CASES if case.generation_mode == "reference_video"],
+    ids=lambda case: case.route_id,
+)
+def test_three_reference_route_web_manual_edits_atomically_reject_mixed_speech_on_save(
+    client: TestClient, tmp_path: Path, case: SpeechContractCase
+):
+    uid = _seed_unit(client)
+    before = client.get("/api/v1/projects/demo/reference-videos/episodes/1/units").json()["units"][0]
+    before["generated_assets"] = {"video_clip": f"reference_videos/{uid}.mp4", "status": "completed"}
+    # 模拟已有付费生成历史；人工正文修改失败时 locked_script 不得写回任何候选字段。
+    from server.routers import reference_videos as router_mod
+
+    pm = router_mod.get_project_manager()
+    project_file = tmp_path / "projects" / "demo" / "project.json"
+    project = json.loads(project_file.read_text(encoding="utf-8"))
+    project["content_mode"] = case.content_mode
+    project_file.write_text(json.dumps(project, ensure_ascii=False), encoding="utf-8")
+    script = pm.load_script("demo", "episode_1.json")
+    script["content_mode"] = case.content_mode
+    script["video_units"][0]["generated_assets"] = before["generated_assets"]
+    pm.save_script("demo", script, "episode_1.json")
+
+    response = client.patch(
+        f"/api/v1/projects/demo/reference-videos/episodes/1/units/{uid}",
+        json={"prompt": "镜头1：张三推门\n@[张三]：{快走。}\n{风吹过旷野。}"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["problems"][0]["code"] == "mixed_speech"
+    after = client.get("/api/v1/projects/demo/reference-videos/episodes/1/units").json()["units"][0]
+    assert after["shots"] == before["shots"]
+    assert after["generated_assets"] == before["generated_assets"]
+
+
+@pytest.mark.integration
+def test_patch_allows_unchanged_legacy_mixed_prompt(client: TestClient):
+    uid = _seed_unit(client)
+    prompt = "镜头1：张三推门\n@[张三]：{快走。}\n{风吹过旷野。}"
+    from server.routers import reference_videos as router_mod
+
+    pm = router_mod.get_project_manager()
+    script = pm.load_script("demo", "episode_1.json")
+    script["video_units"][0]["shots"] = [{"text": "张三推门\n@[张三]：{快走。}\n{风吹过旷野。}"}]
+    script["video_units"][0]["needs_replan"] = True
+    pm.save_script("demo", script, "episode_1.json")
+
+    response = client.patch(
+        f"/api/v1/projects/demo/reference-videos/episodes/1/units/{uid}",
+        json={"prompt": prompt, "note": "保留历史媒体"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["unit"]["note"] == "保留历史媒体"
+    assert response.json()["unit"]["needs_replan"] is True
 
 
 @pytest.mark.integration
@@ -210,6 +338,68 @@ def test_patch_unit_references_only(client: TestClient):
     assert len(resp.json()["unit"]["references"]) == 2
 
 
+@pytest.mark.integration
+def test_add_nonblank_unit_derives_registered_references_when_omitted(client: TestClient):
+    response = client.post(
+        "/api/v1/projects/demo/reference-videos/episodes/1/units",
+        json={"prompt": "@[酒馆]：木门被风吹开", "duration_seconds": 5},
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["unit"]["references"] == [{"type": "scene", "name": "酒馆"}]
+
+
+@pytest.mark.integration
+def test_patch_unit_references_atomically_rejects_new_parse_failure(client: TestClient):
+    uid = _seed_unit(client)
+    from server.routers import reference_videos as router_mod
+
+    pm = router_mod.get_project_manager()
+    script = pm.load_script("demo", "episode_1.json")
+    script["video_units"][0].update(
+        {
+            "shots": [{"text": "@[酒馆]：木门被风吹开"}],
+            "references": [{"type": "scene", "name": "酒馆"}],
+        }
+    )
+    pm.save_script("demo", script, "episode_1.json")
+
+    response = client.patch(
+        f"/api/v1/projects/demo/reference-videos/episodes/1/units/{uid}",
+        json={"references": []},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["problems"][0]["code"] == "parse_failed"
+    saved = client.get("/api/v1/projects/demo/reference-videos/episodes/1/units").json()["units"][0]
+    assert saved["references"] == [{"type": "scene", "name": "酒馆"}]
+
+
+@pytest.mark.integration
+def test_patch_unit_references_can_repair_parse_failure(client: TestClient):
+    uid = _seed_unit(client)
+    from server.routers import reference_videos as router_mod
+
+    pm = router_mod.get_project_manager()
+    script = pm.load_script("demo", "episode_1.json")
+    script["video_units"][0].update(
+        {
+            "shots": [{"text": "@[酒馆]：木门被风吹开"}],
+            "references": [],
+            "needs_replan": True,
+        }
+    )
+    pm.save_script("demo", script, "episode_1.json")
+
+    response = client.patch(
+        f"/api/v1/projects/demo/reference-videos/episodes/1/units/{uid}",
+        json={"references": [{"type": "scene", "name": "酒馆"}]},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["unit"].get("needs_replan") is not True
+
+
 @pytest.mark.unit
 def test_patch_unit_rejects_unknown_reference(client: TestClient):
     uid = _seed_unit(client)
@@ -243,9 +433,8 @@ def test_patch_unit_accepts_nfc_reference_for_nfd_registered_name(client: TestCl
 
 
 @pytest.mark.integration
-def test_unit_references_persisted_as_nfc(client: TestClient):
-    """add/patch 落盘的 reference name 统一 NFC：NFD 请求名（macOS 输入法/拖放形态）
-    不得以原始编码持久化，否则同一资产在 references 里会出现视觉同名的两种形态。"""
+def test_unit_references_persisted_in_asset_comparison_form(client: TestClient):
+    """add/patch 落盘的 reference name 统一 strip + NFC。"""
     from server.routers import reference_videos as router_mod
 
     name_nfd = unicodedata.normalize("NFD", "Hiếu")
@@ -260,7 +449,7 @@ def test_unit_references_persisted_as_nfc(client: TestClient):
         json={
             "prompt": "镜头1：推门",
             "duration_seconds": 3,
-            "references": [{"type": "character", "name": name_nfd}],
+            "references": [{"type": "character", "name": f" {name_nfd} "}],
         },
     )
     assert resp.status_code == 201, resp.text
@@ -269,7 +458,12 @@ def test_unit_references_persisted_as_nfc(client: TestClient):
 
     resp = client.patch(
         f"/api/v1/projects/demo/reference-videos/episodes/1/units/{unit['unit_id']}",
-        json={"references": [{"type": "character", "name": name_nfd}, {"type": "character", "name": "张三"}]},
+        json={
+            "references": [
+                {"type": "character", "name": f" {name_nfd} "},
+                {"type": "character", "name": " 张三 "},
+            ]
+        },
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["unit"]["references"] == [
@@ -356,16 +550,159 @@ def test_generate_unit_enqueues_task(client: TestClient, monkeypatch: pytest.Mon
     assert enqueued[0]["task_type"] == "reference_video"
     assert enqueued[0]["media_type"] == "video"
     assert enqueued[0]["resource_id"] == uid
-    # 经统一守卫点构造：shots[*].text 拼接出的 prompt 随 payload 入队（见 ADR-0001）。
-    # parse_prompt 已剥离 `Shot N (Xs):` header，存盘的 shot text 仅余正文。
-    assert enqueued[0]["payload"]["prompt"] == "@张三 推门"
+    # 当前文本只作结构守卫，任务只保定位与请求选项；worker 执行前重读最新剧本。
+    assert "prompt" not in enqueued[0]["payload"]
+    assert enqueued[0]["payload"]["reference_request_options"] == {"narration_delivery": "post_production"}
+
+
+@pytest.mark.integration
+def test_generate_unit_requires_and_persists_explicit_duration_confirmation(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uid = _seed_unit(client)  # 3s
+    _patch_supported_durations(monkeypatch, [4, 8])
+    enqueued: list[dict[str, object]] = []
+
+    class _FakeQueue:
+        async def enqueue_task(self, **kwargs):
+            enqueued.append(kwargs)
+            return {"task_id": "task-confirmed", "deduped": False}
+
+    from server.routers import reference_videos as router_mod
+
+    monkeypatch.setattr(router_mod, "get_generation_queue", lambda: _FakeQueue())
+
+    unconfirmed = client.post(f"/api/v1/projects/demo/reference-videos/episodes/1/units/{uid}/generate")
+    assert unconfirmed.status_code == 400
+    assert enqueued == []
+
+    confirmed = client.post(
+        f"/api/v1/projects/demo/reference-videos/episodes/1/units/{uid}/generate",
+        json={"confirmed_request_duration_seconds": 4},
+    )
+    assert confirmed.status_code == 202, confirmed.text
+    assert confirmed.json()["projection"]["request_duration"] == 4
+    payload = enqueued[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload == {
+        "script_file": "scripts/episode_1.json",
+        "reference_request_options": {
+            "narration_delivery": "post_production",
+            "confirmed_request_duration_seconds": 4,
+        },
+    }
+
+
+@pytest.mark.integration
+def test_generate_unit_use_tts_returns_the_current_cross_tier_quote_before_enqueue(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.routers import reference_videos as router_mod
+    from server.services.cost_estimation import VideoRequestQuote
+
+    unit_id = _seed_unit(client)
+    _patch_supported_durations(monkeypatch, [4, 8, 12])
+    enqueued: list[dict[str, object]] = []
+
+    class _FakeQueue:
+        async def enqueue_task(self, **kwargs):
+            enqueued.append(kwargs)
+            return {"task_id": "task-confirmed", "deduped": False}
+
+    async def _current_options(**kwargs):
+        return replace(
+            kwargs["options"],
+            current_tts_duration_seconds=8.0,
+            current_visual_duration_seconds=4,
+        )
+
+    monkeypatch.setattr(router_mod, "prepare_current_reference_video_request_options", _current_options)
+    monkeypatch.setattr(
+        router_mod,
+        "quote_video_request",
+        AsyncMock(return_value=VideoRequestQuote(0.8, "USD", "fake", "fake-model", 8)),
+    )
+    monkeypatch.setattr(router_mod, "get_generation_queue", lambda: _FakeQueue())
+    endpoint = f"/api/v1/projects/demo/reference-videos/episodes/1/units/{unit_id}/generate"
+
+    pending = client.post(endpoint, json={"narration_delivery": "use_tts"})
+    assert pending.status_code == 400
+    assert pending.json()["detail"]["request_cost"] == {
+        "amount": 0.8,
+        "currency": "USD",
+        "provider_id": "fake",
+        "model_id": "fake-model",
+        "request_duration_seconds": 8,
+    }
+    assert enqueued == []
+
+    accepted = client.post(
+        endpoint,
+        json={"narration_delivery": "use_tts", "confirmed_request_duration_seconds": 8},
+    )
+    assert accepted.status_code == 202, accepted.text
+    assert accepted.json()["projection"]["request_cost"]["amount"] == 0.8
+    assert enqueued[0]["payload"] == {
+        "script_file": "scripts/episode_1.json",
+        "reference_request_options": {
+            "narration_delivery": "use_tts",
+            "confirmed_request_duration_seconds": 8,
+        },
+    }
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "case",
+    [case for case in SPEECH_CONTRACT_CASES if case.generation_mode == "reference_video"],
+    ids=lambda case: case.route_id,
+)
+def test_three_reference_route_web_video_entries_share_structured_speech_admission(
+    client: TestClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: SpeechContractCase,
+):
+    project_path = tmp_path / "projects" / "demo"
+    project_file = project_path / "project.json"
+    project = json.loads(project_file.read_text(encoding="utf-8"))
+    project["content_mode"] = case.content_mode
+    project_file.write_text(json.dumps(project, ensure_ascii=False), encoding="utf-8")
+    script_file = project_path / "scripts" / "episode_1.json"
+    script = json.loads(script_file.read_text(encoding="utf-8"))
+    script.update(case.script())
+    script_file.write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
+
+    from server.routers import reference_videos as router_mod
+
+    enqueue = AsyncMock()
+
+    def get_generation_queue():
+        return type("Queue", (), {"enqueue_task": enqueue})()
+
+    monkeypatch.setattr(router_mod, "get_generation_queue", get_generation_queue)
+
+    response = client.post("/api/v1/projects/demo/reference-videos/episodes/1/units/E1U1/generate")
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    problem = detail["problems"][0]
+    assert detail["allowed"] is False
+    assert detail["unit_id"] == "E1U1"
+    assert problem["code"] == "mixed_speech"
+    assert [tuple(location["path"]) for location in problem["locations"]] == list(case.expected_locations)
+    assert [location["line"] for location in problem["locations"]] == [0, 1]
+    assert problem["reason"] == "character_and_narrator_mixed"
+    assert problem["action"] == "replan_unit"
+    enqueue.assert_not_awaited()
 
 
 @pytest.mark.unit
 def test_generate_unit_bucket_capability_error_returns_400(client: TestClient, monkeypatch: pytest.MonkeyPatch):
-    """r2v 桶预检失败（如默认模型缺参考图能力）→ 提交入口 400 + 修复指引，不入队。"""
-    from lib.api_errors import BadRequestError
+    """公共投影返回 r2v 能力 blocker 时提交入口不入队。"""
     from lib.i18n import _ as i18n_message
+    from lib.reference_video.request_projection import ProjectionProblem
 
     uid = _seed_unit(client)
     enqueued: list[dict] = []
@@ -379,17 +716,52 @@ def test_generate_unit_bucket_capability_error_returns_400(client: TestClient, m
 
     monkeypatch.setattr(router_mod, "get_generation_queue", lambda: _FakeQueue())
 
-    async def _reject(project, capability):
-        assert capability == "r2v"
-        raise BadRequestError("video_capability_missing_r2v", provider="minimax", model="MiniMax-Hailuo-2.3")
+    base_project = _projection_with_durations([3, 6, 9])
 
-    monkeypatch.setattr(router_mod, "require_video_bucket_capability", _reject)
+    async def _reject(**kwargs):
+        projection = await base_project(**kwargs)
+        assert projection.hydrated_capability == "r2v"
+        return replace(
+            projection,
+            problems=(
+                ProjectionProblem(
+                    code="video_capability_missing_r2v",
+                    blocking=True,
+                    params=(("provider", "minimax"), ("model", "MiniMax-Hailuo-2.3")),
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(router_mod, "project_reference_unit_request", _reject)
 
     resp = client.post(f"/api/v1/projects/demo/reference-videos/episodes/1/units/{uid}/generate")
     assert resp.status_code == 400, resp.text
-    assert resp.json()["detail"] == i18n_message(
-        "video_capability_missing_r2v", provider="minimax", model="MiniMax-Hailuo-2.3"
-    )
+    detail = resp.json()["detail"]
+    assert detail == {
+        "allowed": False,
+        "kind": "reference_request_projection",
+        "advisory": True,
+        "unit_id": uid,
+        "declared_capability": "r2v",
+        "hydrated_capability": "r2v",
+        "provider_id": "fake",
+        "model_id": "fake-model",
+        "planned_duration": 3,
+        "current_visual_duration": None,
+        "duration_input": 3,
+        "request_duration": 3,
+        "problems": [
+            {
+                "code": "video_capability_missing_r2v",
+                "blocking": True,
+                "unit_id": uid,
+                "locations": [{"path": ["references"], "line": None}],
+                "params": {"provider": "minimax", "model": "MiniMax-Hailuo-2.3"},
+                "action": "configure_video_model",
+                "message": i18n_message("video_capability_missing_r2v", provider="minimax", model="MiniMax-Hailuo-2.3"),
+            }
+        ],
+    }
     assert enqueued == []
 
 
@@ -414,11 +786,14 @@ def test_generate_unit_degenerate_precheck_uses_i2v_bucket(
     monkeypatch.setattr(router_mod, "get_generation_queue", lambda: _FakeQueue())
 
     checked: list[str] = []
+    base_project = _projection_with_durations([3, 6, 9])
 
-    async def _record(project, capability):
-        checked.append(capability)
+    async def _record(**kwargs):
+        projection = await base_project(**kwargs)
+        checked.append(projection.hydrated_capability)
+        return projection
 
-    monkeypatch.setattr(router_mod, "require_video_bucket_capability", _record)
+    monkeypatch.setattr(router_mod, "project_reference_unit_request", _record)
 
     resp = client.post("/api/v1/projects/demo/reference-videos/episodes/1/units/E1U1/generate")
     assert resp.status_code == 202, resp.text
@@ -443,12 +818,27 @@ def test_generate_unit_missing_returns_404(client: TestClient):
     assert resp.status_code == 404
 
 
+def _projection_with_durations(durations: list[int]):
+    return fake_reference_request_projector(durations=tuple(durations))
+
+
 def _patch_supported_durations(monkeypatch: pytest.MonkeyPatch, durations: list[int]) -> None:
     from server.routers import reference_videos as router_mod
     from server.services.reference_video_tasks import ProjectDurationContext
 
-    ctx = ProjectDurationContext(supported_durations=tuple(durations), resolution=None, provider_id="", model_name=None)
-    monkeypatch.setattr(router_mod, "resolve_project_duration_context", AsyncMock(return_value=ctx))
+    monkeypatch.setattr(router_mod, "project_reference_unit_request", _projection_with_durations(durations))
+    monkeypatch.setattr(
+        router_mod,
+        "resolve_project_duration_context",
+        AsyncMock(
+            return_value=ProjectDurationContext(
+                supported_durations=tuple(durations),
+                resolution="1080p",
+                provider_id="fake",
+                model_name="fake-model",
+            )
+        ),
+    )
 
 
 def _precheck(client: TestClient, unit_id: str):
@@ -463,10 +853,22 @@ def test_precheck_slot_member_needs_no_confirmation(client: TestClient, monkeypa
 
     body = _precheck(client, uid).json()
     assert body == {
+        "allowed": True,
+        "kind": "reference_request_projection",
+        "advisory": True,
+        "unit_id": uid,
+        "planned_duration": 3,
         "needs_confirmation": False,
         "script_duration": 3,
+        "current_visual_duration": None,
+        "duration_input": 3,
         "request_duration": 3,
         "adjustment": "exact",
+        "declared_capability": "r2v",
+        "hydrated_capability": "r2v",
+        "provider_id": "fake",
+        "model_id": "fake-model",
+        "problems": [],
     }
 
 
@@ -484,27 +886,258 @@ def test_precheck_rounds_up_and_needs_confirmation(client: TestClient, monkeypat
 
 
 @pytest.mark.integration
-def test_precheck_over_largest_slot_reports_shorter_clip(client: TestClient, monkeypatch: pytest.MonkeyPatch):
-    """总时长超过最大档位 → 需确认，按最大档位申请（成片短于剧本编排）。"""
-    uid = _seed_unit(client)  # 3s
-    _patch_supported_durations(monkeypatch, [1, 2])
+@pytest.mark.parametrize(
+    ("current_visual_tier", "reusable_visual_tier", "needs_confirmation", "expected_amount"),
+    [(8, 8, False, 0.0), (8, None, False, 0.8), (4, None, True, 0.8)],
+)
+def test_precheck_prices_the_latest_tts_tier_against_the_selected_visual(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    current_visual_tier: int,
+    reusable_visual_tier: int | None,
+    needs_confirmation: bool,
+    expected_amount: float,
+) -> None:
+    from server.routers import reference_videos as router_mod
+    from server.services.cost_estimation import VideoRequestQuote
 
-    body = _precheck(client, uid).json()
-    assert body["needs_confirmation"] is True
-    assert body["request_duration"] == 2
-    assert body["adjustment"] == "down"
+    unit_id = _seed_unit(client)
+    _patch_supported_durations(monkeypatch, [4, 8, 12])
+
+    async def _current_options(**kwargs):
+        return replace(
+            kwargs["options"],
+            current_tts_duration_seconds=8.0,
+            current_visual_duration_seconds=current_visual_tier,
+            current_reusable_visual_duration_seconds=reusable_visual_tier,
+        )
+
+    monkeypatch.setattr(router_mod, "prepare_current_reference_video_request_options", _current_options)
+    monkeypatch.setattr(
+        router_mod,
+        "quote_video_request",
+        AsyncMock(
+            return_value=VideoRequestQuote(
+                amount=0.8,
+                currency="USD",
+                provider_id="fake",
+                model_id="fake-model",
+                request_duration_seconds=8,
+            )
+        ),
+    )
+
+    response = client.get(
+        f"/api/v1/projects/demo/reference-videos/episodes/1/units/{unit_id}/duration-precheck",
+        params={"narration_delivery": "use_tts"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["request_duration"] == 8
+    assert body["needs_confirmation"] is needs_confirmation
+    assert body["request_cost"] == {
+        "amount": expected_amount,
+        "currency": "USD",
+        "provider_id": "fake",
+        "model_id": "fake-model",
+        "request_duration_seconds": 8,
+    }
 
 
 @pytest.mark.integration
-def test_precheck_unresolvable_capability_passes_through(client: TestClient, monkeypatch: pytest.MonkeyPatch):
-    """能力不可解析（档位集为空）→ 沿用现状放行，无确认。"""
+def test_precheck_blocks_cross_tier_tts_when_exact_cost_is_unavailable(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.routers import reference_videos as router_mod
+
+    unit_id = _seed_unit(client)
+    _patch_supported_durations(monkeypatch, [4, 8, 12])
+
+    async def _current_options(**kwargs):
+        return replace(
+            kwargs["options"],
+            current_tts_duration_seconds=8.0,
+            current_visual_duration_seconds=4,
+        )
+
+    monkeypatch.setattr(router_mod, "prepare_current_reference_video_request_options", _current_options)
+    monkeypatch.setattr(router_mod, "quote_video_request", AsyncMock(return_value=None))
+
+    response = client.get(
+        f"/api/v1/projects/demo/reference-videos/episodes/1/units/{unit_id}/duration-precheck",
+        params={"narration_delivery": "use_tts"},
+    )
+
+    assert response.status_code == 400
+    assert [problem["code"] for problem in response.json()["detail"]["problems"]] == [
+        "reference_duration_confirmation_required",
+        "video_request_cost_unavailable",
+    ]
+
+
+@pytest.mark.integration
+def test_precheck_use_tts_while_regenerating_returns_canonical_problem(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An active explicit regeneration shadows the old formal audio for Web requests."""
+    from lib.reference_video.request_projection import ProjectionProblem
+    from server.routers import reference_videos as router_mod
+
+    unit_id = _seed_unit(client)
+    base_project = _projection_with_durations([3, 6, 9])
+
+    async def _project(**kwargs):
+        assert kwargs["tts_in_progress"] is True
+        projection = await base_project(**kwargs)
+        return replace(
+            projection,
+            problems=(
+                ProjectionProblem(
+                    code="tts_generating",
+                    blocking=True,
+                    reason="tts_generation_in_progress",
+                    action="wait_for_tts",
+                    locations=(("generated_assets", "narration_audio"),),
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(router_mod, "tts_task_in_progress", AsyncMock(return_value=True))
+    monkeypatch.setattr(router_mod, "project_reference_unit_request", _project)
+
+    response = client.get(
+        f"/api/v1/projects/demo/reference-videos/episodes/1/units/{unit_id}/duration-precheck",
+        params={"narration_delivery": "use_tts"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["problems"][0] == {
+        "code": "tts_generating",
+        "blocking": True,
+        "unit_id": unit_id,
+        "locations": [{"path": ["generated_assets", "narration_audio"], "line": None}],
+        "params": {},
+        "action": "wait_for_tts",
+        "reason": "tts_generation_in_progress",
+        "message": "旁白音频仍在生成；请等待完成后再使用 TTS 交付",
+    }
+
+
+@pytest.mark.integration
+def test_precheck_uses_actual_tts_duration_as_floor(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    created = client.post(
+        "/api/v1/projects/demo/reference-videos/episodes/1/units",
+        json={"prompt": "镜头1：海面\n{旁白正文。}", "duration_seconds": 3, "references": []},
+    )
+    assert created.status_code == 201, created.text
+    uid = created.json()["unit"]["unit_id"]  # 剧本 3s，实际旁白 9.5s
+    _patch_supported_durations(monkeypatch, [4, 8, 12])
+
+    from lib.artifact_manifest import ArtifactComparison, ArtifactStatus
+    from lib.narration_delivery import NarrationAudioEvidence, TtsSynthesisSettings, prepare_narration_delivery
+
+    async def _project_with_current_tts(**kwargs):
+        preparation = prepare_narration_delivery(
+            delivery="use_tts",
+            preparation=admit_script_unit("video_units", kwargs["unit"]).preparation,
+            artifact_path=f"audio/segment_{uid}.wav",
+            settings=TtsSynthesisSettings("fake-audio", "tts-model", "voice", None),
+            evidence=NarrationAudioEvidence(
+                comparison=ArtifactComparison(
+                    status=ArtifactStatus.CURRENT,
+                    artifact_path=f"audio/segment_{uid}.wav",
+                ),
+                present=True,
+                duration_seconds=9.5,
+            ),
+        )
+        kwargs["options"] = replace(
+            kwargs["options"],
+            current_tts_duration_seconds=9.5,
+            narration_preparation=preparation,
+        )
+        return await _projection_with_durations([4, 8, 12])(**kwargs)
+
+    from lib.speech_composition import admit_script_unit
+    from server.routers import reference_videos as router_mod
+
+    async def _options_identity(**kwargs):
+        return kwargs["options"]
+
+    monkeypatch.setattr(router_mod, "prepare_current_reference_video_request_options", _options_identity)
+    monkeypatch.setattr(router_mod, "project_reference_unit_request", _project_with_current_tts)
+
+    response = client.get(
+        f"/api/v1/projects/demo/reference-videos/episodes/1/units/{uid}/duration-precheck",
+        params={"narration_delivery": "use_tts"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["script_duration"] == 3
+    assert body["duration_input"] == 9.5
+    assert body["request_duration"] == 12
+    assert body["adjustment"] == "up"
+
+
+@pytest.mark.integration
+def test_precheck_over_largest_slot_requires_replan(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    """总时长超过最大档位时不得截断，返回结构化重新规划 blocker。"""
+    uid = _seed_unit(client)  # 3s
+    _patch_supported_durations(monkeypatch, [1, 2])
+
+    response = _precheck(client, uid)
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail["request_duration"] == 2
+    assert detail["problems"][0]["code"] == "needs_replan"
+    assert detail["problems"][0]["action"] == "replan_unit"
+
+
+@pytest.mark.integration
+def test_precheck_empty_duration_metadata_returns_structured_blocker(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    """档位集为空时 fail loud，不返回伪可执行的 unconstrained 结果。"""
+    from lib.i18n import _ as i18n_message
+
     uid = _seed_unit(client)
     _patch_supported_durations(monkeypatch, [])
 
-    body = _precheck(client, uid).json()
-    assert body["needs_confirmation"] is False
-    assert body["adjustment"] == "unconstrained"
-    assert body["request_duration"] == 3
+    response = _precheck(client, uid)
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail["kind"] == "reference_request_projection"
+    assert detail["unit_id"] == uid
+    assert detail["problems"][0] == {
+        "code": "reference_supported_durations_missing",
+        "blocking": True,
+        "unit_id": uid,
+        "locations": [{"path": ["duration_seconds"], "line": None}],
+        "params": {"provider": "fake", "model": "fake-model"},
+        "action": "configure_video_model",
+        "message": i18n_message("reference_supported_durations_missing", provider="fake", model="fake-model"),
+    }
+
+
+@pytest.mark.integration
+def test_precheck_formats_missing_asset_message_for_people(client: TestClient, tmp_path: Path) -> None:
+    from lib.i18n import _ as i18n_message
+
+    uid = _seed_unit(client)
+    (tmp_path / "projects" / "demo" / "characters" / "张三.png").unlink()
+
+    response = _precheck(client, uid)
+
+    assert response.status_code == 400, response.text
+    problems = response.json()["detail"]["problems"]
+    missing = next(problem for problem in problems if problem["code"] == "reference_asset_missing")
+    assert missing["params"]["missing"] == [["character", "张三"]]
+    assert missing["params"]["missing_text"] == "character: 张三"
+    assert missing["message"] == i18n_message("reference_asset_missing", missing_text="character: 张三")
 
 
 @pytest.mark.integration

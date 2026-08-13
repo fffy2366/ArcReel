@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi import Path as FastAPIPath
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 from pydantic import ValidationError as PydanticValidationError
 from starlette.background import BackgroundTask
 
@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 from lib.api_errors import ApiError, BadRequestError, NotFoundError
 from lib.asset_fingerprints import compute_asset_fingerprints
+from lib.asset_types import asset_name_comparison_key
 from lib.config.registry import default_model_for_provider
 from lib.config.resolver import ConfigResolver, VideoBucketCapabilityError
 from lib.db import async_session_factory
@@ -39,10 +40,18 @@ from lib.json_io import domain_error_on_value_error
 from lib.profile_manifest import ContentMode
 from lib.project_change_hints import project_change_source
 from lib.project_manager import EmptySourceError, EpisodeScriptReboundError, SourceKind, get_project_manager
+from lib.script_batch_edit import ScriptBatchEditCommand, ScriptBatchEditor, script_revision
+from lib.speech_rate import MAX_SPEECH_RATE_UPS, MIN_SPEECH_RATE_UPS, SPEECH_RATE_FIELD, is_valid_speech_rate
 from lib.status_calculator import StatusCalculator
 from lib.style_templates import is_known_template, resolve_template_prompt
+from lib.workflow_state import WorkflowStateService, WorkflowStatus
 from server.auth import CurrentUser, create_download_token, verify_download_token
 from server.routers._reorder import full_permutation_error
+from server.routers._script_edits import (
+    execute_current_script_edit,
+    require_script_edit_result,
+    script_batch_status,
+)
 from server.routers._validators import validate_backend_value
 from server.services.project_archive import (
     ProjectArchiveService,
@@ -71,6 +80,10 @@ def get_archive_service() -> ProjectArchiveService:
     return ProjectArchiveService(get_project_manager())
 
 
+def get_script_batch_editor(manager: Any | None = None) -> ScriptBatchEditor:
+    return ScriptBatchEditor(manager or get_project_manager())
+
+
 # 项目级模型字段：创建时逐一校验并写入 project.json，PATCH 时另加 audio_backend。
 # 值形如 provider/model 或裸 provider，空值 = 清除该层、回退下一层。
 _PROJECT_BACKEND_FIELDS = (
@@ -84,6 +97,35 @@ _PROJECT_BACKEND_FIELDS = (
     "text_backend_complex",
     "default_text_backend",
 )
+
+
+def _reject_bool_speech_rate(value: object) -> object:
+    """布尔不是语速：Pydantic 非严格模式会把 JSON ``true`` 折成 1.0、``false`` 折成 0.0。
+
+    真相源与数据校验器都把 bool 判为脏值，写入侧若放行，落库后的 1.0 已无从辨认原本是布尔，
+    而 0.0 又会被当成「未填」跳过写入——同一类输入两种结局。在进入区间校验前直接拒。
+    """
+    if isinstance(value, bool):
+        raise ValueError("speech rate must be a number, not a boolean")
+    return value
+
+
+#: 创建 / PATCH 请求上的口播语速估算字段类型，两个模型共用同一把布尔守卫。
+SpeechRateOverride = Annotated[float | None, BeforeValidator(_reject_bool_speech_rate)]
+
+
+def _validated_speech_rate(value: float, _t: Translator) -> float:
+    """把创建 / PATCH 传入的口播语速估算收进硬区间，越界即 422。
+
+    区间与 ``lib.speech_rate`` 的读时守卫、前端输入校验同一把尺（``is_valid_speech_rate``），
+    不在这里另写边界数字。
+    """
+    rate = float(value)
+    if not is_valid_speech_rate(rate):
+        raise HTTPException(
+            status_code=422, detail=_t("speech_rate_out_of_range", min=MIN_SPEECH_RATE_UPS, max=MAX_SPEECH_RATE_UPS)
+        )
+    return rate
 
 
 class CreateProjectRequest(BaseModel):
@@ -106,6 +148,9 @@ class CreateProjectRequest(BaseModel):
     # 宫格分镜开关：只改变分镜图的生产方式，不是独立路线；仅 storyboard 路线有意义，
     # 创建后可经项目 PATCH 随时切换。ad 项目拒绝开启。
     grid_storyboard: bool = False
+    # 口播语速估算（阅读单位 / 秒）项目级覆盖：空 = 回退 lib.speech_rate 的语言默认。
+    # 与 TTS 的 narration_speed（供应商配音倍率）无关，两者不联动。
+    speech_rate_units_per_second: SpeechRateOverride = None
     # ===== 新增 =====
     style_template_id: str | None = None
     video_backend: str | None = None
@@ -164,6 +209,8 @@ class UpdateProjectRequest(BaseModel):
     audio_backend: str | None = None
     narration_voice: str | None = None
     narration_speed: float | None = None
+    # 口播语速估算（阅读单位 / 秒）项目级覆盖；null = 清除、回退语言默认
+    speech_rate_units_per_second: SpeechRateOverride = None
     # 文本任务档位（docs/adr/0051）项目级覆盖 + 项目默认模型；空值 = 清除、继承全局
     text_backend_simple: str | None = None
     text_backend_complex: str | None = None
@@ -532,6 +579,14 @@ async def create_project(
                 if value:
                     validate_backend_value(value, field_name, _t)
 
+            # 口播语速估算：可选，未填则不落盘（缺省即回退 lib.speech_rate 的语言默认）。
+            # 在 create_project 之前判，越界请求不留下半成品项目目录。
+            speech_rate = (
+                None
+                if req.speech_rate_units_per_second is None
+                else _validated_speech_rate(req.speech_rate_units_per_second, _t)
+            )
+
             try:
                 manager.create_project(project_name, content_mode=req.content_mode or "narration")
             except FileExistsError:
@@ -543,6 +598,8 @@ async def create_project(
             # 两字段恒写显式值（grid_storyboard 默认 false 也落盘），新项目即 v5 完整形态
             extras["generation_mode"] = req.generation_mode
             extras["grid_storyboard"] = req.grid_storyboard
+            if speech_rate is not None:
+                extras[SPEECH_RATE_FIELD] = speech_rate
             with project_change_source("webui"):
                 project = manager.create_project_metadata(
                     project_name,
@@ -616,6 +673,23 @@ async def get_video_capabilities(
         ) from exc
 
 
+@router.get("/projects/{name}/workflow-status", response_model=WorkflowStatus)
+async def get_workflow_status(
+    name: str,
+    episode: Annotated[int | None, Query(ge=1)] = None,
+):
+    """Return the authenticated, server-authoritative project workflow status."""
+
+    try:
+        return await asyncio.to_thread(WorkflowStateService(get_project_manager()).get_status, name, episode)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=name) from exc
+    except json.JSONDecodeError:
+        raise
+    except ValueError as exc:
+        raise BadRequestError("request_invalid") from exc
+
+
 @router.get("/projects/{name}")
 async def get_project(
     name: str,
@@ -669,6 +743,55 @@ async def get_project(
         raise
     except Exception:
         logger.exception("请求处理失败")
+        raise HTTPException(status_code=500, detail=_t("internal_server_error"))
+
+
+@router.get("/projects/{name}/agent-profile")
+async def get_agent_profile_status(name: str, _t: Translator):
+    """Return project-local Agent Profile customizations."""
+
+    def _sync():
+        manager = get_project_manager()
+        try:
+            project_dir = manager.get_project_path(name)
+        except ValueError as exc:
+            raise BadRequestError("invalid_project_name", name=name) from exc
+        return manager.get_agent_profile_status(project_dir)
+
+    try:
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=name) from exc
+    except ApiError:
+        raise
+    except Exception:
+        logger.exception("读取项目 Agent Profile 状态失败: project=%s", name)
+        raise HTTPException(status_code=500, detail=_t("internal_server_error"))
+
+
+@router.post("/projects/{name}/agent-profile/reset")
+async def reset_agent_profile(name: str, _t: Translator):
+    """Destructively restore the project Agent Profile to current built-ins."""
+
+    def _sync():
+        manager = get_project_manager()
+        try:
+            project_dir = manager.get_project_path(name)
+        except ValueError as exc:
+            raise BadRequestError("invalid_project_name", name=name) from exc
+        stats = manager.force_resync_profile(project_dir)
+        if stats.get("errors"):
+            raise RuntimeError(f"profile reset completed with {stats['errors']} file errors")
+        return {"customized": False, "customized_files": []}
+
+    try:
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=name) from exc
+    except ApiError:
+        raise
+    except Exception:
+        logger.exception("重置项目 Agent Profile 失败: project=%s", name)
         raise HTTPException(status_code=500, detail=_t("internal_server_error"))
 
 
@@ -732,6 +855,12 @@ async def update_project(name: str, req: UpdateProjectRequest, _t: Translator):
                         if not math.isfinite(speed) or speed <= 0:
                             raise HTTPException(status_code=422, detail=_t("narration_speed_must_be_positive"))
                         project["narration_speed"] = speed
+                # 口播语速估算（阅读单位 / 秒）：宽松硬区间，null = 清除、回退语言默认
+                if "speech_rate_units_per_second" in req.model_fields_set:
+                    if req.speech_rate_units_per_second is None:
+                        project.pop(SPEECH_RATE_FIELD, None)
+                    else:
+                        project[SPEECH_RATE_FIELD] = _validated_speech_rate(req.speech_rate_units_per_second, _t)
                 if "aspect_ratio" in req.model_fields_set and req.aspect_ratio is not None:
                     project["aspect_ratio"] = req.aspect_ratio
                 if "grid_storyboard" in req.model_fields_set:
@@ -858,7 +987,7 @@ async def get_script(name: str, script_file: str, _t: Translator):
     """获取剧本内容"""
     try:
         script = await asyncio.to_thread(get_project_manager().load_script, name, script_file)
-        return {"script": script}
+        return {"script": script, "revision": script_revision(script)}
     except FileNotFoundError as exc:
         raise NotFoundError("script_not_found", name=script_file) from exc
     except HTTPException:
@@ -866,6 +995,35 @@ async def get_script(name: str, script_file: str, _t: Translator):
     except Exception:
         logger.exception("请求处理失败")
         raise HTTPException(status_code=500, detail=_t("internal_server_error"))
+
+
+@router.post("/projects/{name}/script-edits", response_model=None)
+async def edit_script_batch(name: str, command: ScriptBatchEditCommand, _t: Translator) -> JSONResponse:
+    """Execute the same revisioned script-edit command exposed to the in-process Agent."""
+
+    manager = None
+    try:
+        manager = get_project_manager()
+        try:
+            manager.get_project_path(name)
+        except ValueError as exc:
+            raise BadRequestError("invalid_project_name", name=name) from exc
+        except FileNotFoundError as exc:
+            raise NotFoundError("project_not_found", name=name) from exc
+
+        with project_change_source("webui"):
+            result = await asyncio.to_thread(get_script_batch_editor(manager).execute, name, command)
+        return JSONResponse(status_code=script_batch_status(result), content=result.model_dump(mode="json"))
+    except FileNotFoundError as exc:
+        if manager is None or not manager.project_exists(name):
+            raise NotFoundError("project_not_found", name=name) from exc
+        target = command.script or str(command.episode)
+        raise NotFoundError("script_not_found", name=target) from exc
+    except ApiError:
+        raise
+    except Exception as exc:
+        logger.exception("请求处理失败")
+        raise HTTPException(status_code=500, detail=_t("internal_server_error")) from exc
 
 
 class UpdateSceneRequest(BaseModel):
@@ -885,35 +1043,49 @@ async def update_scene(name: str, scene_id: str, req: UpdateSceneRequest, _t: Tr
 
         def _sync():
             manager = get_project_manager()
-
-            # 整段 RMW 在单一 _script_lock 内完成；未命中时在锁内 raise，跳过写回
-            matched_scene: dict[str, Any] | None = None
+            current = manager.load_script(name, req.script_file)
+            scenes = current.get("scenes")
+            if not isinstance(scenes, list) or not any(
+                isinstance(scene, dict) and scene.get("scene_id") == scene_id for scene in scenes
+            ):
+                raise HTTPException(status_code=404, detail=_t("scene_not_found", id=scene_id))
+            allowed = {
+                "duration_seconds",
+                "image_prompt",
+                "video_prompt",
+                "characters_in_scene",
+                "scenes",
+                "props",
+                "segment_break",
+                "utterances",
+                "note",
+            }
+            fields: dict[str, Any] = {}
+            for key, raw_value in req.updates.items():
+                if key not in allowed or (raw_value is None and key != "note"):
+                    continue
+                value = raw_value
+                if key in {"characters_in_scene", "scenes", "props"} and isinstance(value, list):
+                    value = [asset_name_comparison_key(entry) if isinstance(entry, str) else entry for entry in value]
+                fields[key] = value
+            if not fields:
+                matched = next(scene for scene in scenes if scene.get("scene_id") == scene_id)
+                return {"success": True, "scene": matched}
             with project_change_source("webui"):
-                with manager.locked_script(name, req.script_file) as script:
-                    for scene in script.get("scenes", []):
-                        if scene.get("scene_id") == scene_id:
-                            matched_scene = scene
-                            # 更新允许的字段
-                            for key, value in req.updates.items():
-                                if key in [
-                                    "duration_seconds",
-                                    "image_prompt",
-                                    "video_prompt",
-                                    "characters_in_scene",
-                                    "scenes",
-                                    "props",
-                                    "segment_break",
-                                    "utterances",
-                                    "note",
-                                ]:
-                                    if value is None and key != "note":
-                                        continue
-                                    scene[key] = value
-                            break
-
-                    if matched_scene is None:
-                        raise HTTPException(status_code=404, detail=_t("scene_not_found", id=scene_id))
-            return {"success": True, "scene": matched_scene}
+                result = execute_current_script_edit(
+                    manager,
+                    name,
+                    req.script_file,
+                    [{"op": "update", "id": scene_id, "fields": fields}],
+                    editor=get_script_batch_editor(manager),
+                )
+            require_script_edit_result(
+                result,
+                operation_not_found=True,
+            )
+            saved = manager.load_script(name, req.script_file)
+            matched = next(scene for scene in saved["scenes"] if scene.get("scene_id") == scene_id)
+            return {"success": True, "scene": matched, "edit_result": result.model_dump(mode="json")}
 
         return await asyncio.to_thread(_sync)
     except FileNotFoundError as exc:
@@ -990,25 +1162,33 @@ async def update_shot(name: str, shot_id: str, req: UpdateShotRequest, _t: Trans
 
         def _sync():
             manager = get_project_manager()
-
-            # 整段 RMW 在单一 _script_lock 内完成；模式不符 / 未命中时在锁内 raise，跳过写回
-            matched_shot: dict[str, Any] | None = None
+            current = manager.load_script(name, req.script_file)
+            shots = _require_ad_script(current, _t)
+            matched = next((shot for shot in shots if shot.get("shot_id") == shot_id), None)
+            if matched is None:
+                raise HTTPException(status_code=404, detail=_t("shot_not_found", id=shot_id))
+            fields = {
+                key: value
+                for key, value in req.updates.items()
+                if key in _SHOT_UPDATABLE_FIELDS and (value is not None or key == "note")
+            }
+            if not fields:
+                return {"success": True, "shot": matched}
             with project_change_source("webui"):
-                with manager.locked_script(name, req.script_file) as script:
-                    for shot in _require_ad_script(script, _t):
-                        if shot.get("shot_id") == shot_id:
-                            matched_shot = shot
-                            for key, value in req.updates.items():
-                                if key in _SHOT_UPDATABLE_FIELDS:
-                                    # note 允许显式置 None（清空备注），其余字段 None 视为未提供
-                                    if value is None and key != "note":
-                                        continue
-                                    shot[key] = value
-                            break
-
-                    if matched_shot is None:
-                        raise HTTPException(status_code=404, detail=_t("shot_not_found", id=shot_id))
-            return {"success": True, "shot": matched_shot}
+                result = execute_current_script_edit(
+                    manager,
+                    name,
+                    req.script_file,
+                    [{"op": "update", "id": shot_id, "fields": fields}],
+                    editor=get_script_batch_editor(manager),
+                )
+            require_script_edit_result(
+                result,
+                operation_not_found=True,
+            )
+            saved = manager.load_script(name, req.script_file)
+            matched = next(shot for shot in saved["shots"] if shot.get("shot_id") == shot_id)
+            return {"success": True, "shot": matched, "edit_result": result.model_dump(mode="json")}
 
         return await asyncio.to_thread(_sync)
     except FileNotFoundError as exc:
@@ -1039,26 +1219,34 @@ async def reorder_shots(name: str, req: ReorderShotsRequest, _t: Translator):
 
         def _sync():
             manager = get_project_manager()
-
+            current = manager.load_script(name, req.script_file)
+            shots = _require_ad_script(current, _t)
+            existing_ids = [shot.get("shot_id") for shot in shots]
+            error_kind = full_permutation_error(existing_ids, req.shot_ids)
+            if error_kind is not None:
+                detail_key = {
+                    "length": "shot_ids_length_mismatch",
+                    "duplicate": "duplicate_shot_ids",
+                    "mismatch": "shot_ids_mismatch",
+                }[error_kind]
+                raise HTTPException(status_code=400, detail=_t(detail_key))
+            if existing_ids == req.shot_ids:
+                return {"success": True, "shots": shots}
+            operations = [
+                {"op": "move_after", "id": shot_id, "after_id": req.shot_ids[index - 1] if index else None}
+                for index, shot_id in enumerate(req.shot_ids)
+            ]
             with project_change_source("webui"):
-                with manager.locked_script(name, req.script_file) as script:
-                    shots = _require_ad_script(script, _t)
-                    existing_ids = [s.get("shot_id") for s in shots]
-
-                    # 校验失败 → 在锁内 raise 400，跳过写回
-                    error_kind = full_permutation_error(existing_ids, req.shot_ids)
-                    if error_kind is not None:
-                        detail_key = {
-                            "length": "shot_ids_length_mismatch",
-                            "duplicate": "duplicate_shot_ids",
-                            "mismatch": "shot_ids_mismatch",
-                        }[error_kind]
-                        raise HTTPException(status_code=400, detail=_t(detail_key))
-
-                    by_id = {s["shot_id"]: s for s in shots}
-                    reordered = [by_id[sid] for sid in req.shot_ids]
-                    script["shots"] = reordered
-            return {"success": True, "shots": reordered}
+                result = execute_current_script_edit(
+                    manager,
+                    name,
+                    req.script_file,
+                    operations,
+                    editor=get_script_batch_editor(manager),
+                )
+            require_script_edit_result(result)
+            reordered = manager.load_script(name, req.script_file)["shots"]
+            return {"success": True, "shots": reordered, "edit_result": result.model_dump(mode="json")}
 
         return await asyncio.to_thread(_sync)
     except FileNotFoundError as exc:
@@ -1106,39 +1294,55 @@ async def update_segment(name: str, segment_id: str, req: UpdateSegmentRequest, 
 
         def _sync():
             manager = get_project_manager()
-
-            # 整段 RMW 在单一 _script_lock 内完成；模式不符 / 未命中时在锁内 raise，跳过写回
-            matched_segment: dict[str, Any] | None = None
+            current = manager.load_script(name, req.script_file)
+            if current.get("content_mode") != "narration" or "segments" not in current:
+                raise HTTPException(status_code=400, detail=_t("narration_mode_required"))
+            segments = current.get("segments")
+            if not isinstance(segments, list):
+                raise ValueError("narration script field 'segments' must be a list")
+            matched = next(
+                (
+                    segment
+                    for segment in segments
+                    if isinstance(segment, dict) and segment.get("segment_id") == segment_id
+                ),
+                None,
+            )
+            if matched is None:
+                raise HTTPException(status_code=404, detail=_t("segment_not_found", id=segment_id))
+            fields: dict[str, Any] = {}
+            for field in (
+                "duration_seconds",
+                "segment_break",
+                "image_prompt",
+                "video_prompt",
+                "transition_to_next",
+            ):
+                value = getattr(req, field)
+                if value is not None:
+                    fields[field] = value
+            if "note" in req.model_fields_set:
+                fields["note"] = req.note
+            for field in ("characters_in_segment", "scenes", "props"):
+                if field in req.model_fields_set:
+                    fields[field] = [asset_name_comparison_key(value) for value in (getattr(req, field) or [])]
+            if not fields:
+                return {"success": True, "segment": matched}
             with project_change_source("webui"):
-                with manager.locked_script(name, req.script_file) as script:
-                    # 检查是否为说书模式：仅 narration 且含 segments 键才放行；
-                    # drama 脚本即使残留 segments 键也拒绝，避免被当 narration 改写
-                    if script.get("content_mode") != "narration" or "segments" not in script:
-                        raise HTTPException(status_code=400, detail=_t("narration_mode_required"))
-
-                    for segment in script.get("segments", []):
-                        if segment.get("segment_id") == segment_id:
-                            matched_segment = segment
-                            if req.duration_seconds is not None:
-                                segment["duration_seconds"] = req.duration_seconds
-                            if req.segment_break is not None:
-                                segment["segment_break"] = req.segment_break
-                            if req.image_prompt is not None:
-                                segment["image_prompt"] = req.image_prompt
-                            if req.video_prompt is not None:
-                                segment["video_prompt"] = req.video_prompt
-                            if req.transition_to_next is not None:
-                                segment["transition_to_next"] = req.transition_to_next
-                            if "note" in req.model_fields_set:
-                                segment["note"] = req.note
-                            for field in ("characters_in_segment", "scenes", "props"):
-                                if field in req.model_fields_set:
-                                    segment[field] = getattr(req, field) or []
-                            break
-
-                    if matched_segment is None:
-                        raise HTTPException(status_code=404, detail=_t("segment_not_found", id=segment_id))
-            return {"success": True, "segment": matched_segment}
+                result = execute_current_script_edit(
+                    manager,
+                    name,
+                    req.script_file,
+                    [{"op": "update", "id": segment_id, "fields": fields}],
+                    editor=get_script_batch_editor(manager),
+                )
+            require_script_edit_result(
+                result,
+                operation_not_found=True,
+            )
+            saved = manager.load_script(name, req.script_file)
+            matched = next(segment for segment in saved["segments"] if segment.get("segment_id") == segment_id)
+            return {"success": True, "segment": matched, "edit_result": result.model_dump(mode="json")}
 
         return await asyncio.to_thread(_sync)
     except FileNotFoundError as exc:
@@ -1262,21 +1466,17 @@ async def set_project_source(
         def _sync_write():
             if not manager.project_exists(name):
                 raise HTTPException(status_code=404, detail=_t("project_not_found", name=name))
-            project_dir = manager.get_project_path(name)
-            source_dir = project_dir / "source"
-            source_dir.mkdir(parents=True, exist_ok=True)
-
-            if raw is not None:
-                safe_filename = Path(original_name).name
-                try:
-                    text = raw.decode("utf-8")
-                except UnicodeDecodeError:
-                    raise HTTPException(status_code=400, detail=_t("invalid_encoding"))
-                if len(text) > MAX_CHARS:
-                    raise HTTPException(status_code=400, detail=_t("file_too_large", max_chars=MAX_CHARS))
-                (source_dir / safe_filename).write_text(text, encoding="utf-8")
-                return safe_filename, len(text)
-            else:
+            with manager.locked_source_mutation(name) as source_dir:
+                if raw is not None:
+                    safe_filename = Path(original_name).name
+                    try:
+                        text = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        raise HTTPException(status_code=400, detail=_t("invalid_encoding"))
+                    if len(text) > MAX_CHARS:
+                        raise HTTPException(status_code=400, detail=_t("file_too_large", max_chars=MAX_CHARS))
+                    (source_dir / safe_filename).write_text(text, encoding="utf-8")
+                    return safe_filename, len(text)
                 if len(text_content) > MAX_CHARS:
                     raise HTTPException(status_code=400, detail=_t("file_too_large", max_chars=MAX_CHARS))
                 safe_filename = "novel.txt"

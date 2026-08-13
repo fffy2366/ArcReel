@@ -37,7 +37,7 @@ from lib.json_io import atomic_write_json, load_json_or_none
 from lib.path_safety import PathTraversalError, safe_join
 from lib.project_manager import DEFAULT_SOURCE_KIND, is_reference_video_project
 from lib.prompt_builders_reference import build_reference_units_split_prompt
-from lib.prompt_builders_script import build_narration_split_prompt, build_normalize_prompt
+from lib.prompt_builders_script import append_user_instructions, build_narration_split_prompt, build_normalize_prompt
 from lib.reference_video.draft_validation import (
     DraftViolation,
     collect_violations,
@@ -74,16 +74,30 @@ from lib.script_models import (
     build_drama_normalized_script_model,
     build_reference_units_step1_model,
 )
+from lib.speech_composition import admit_script_unit
+from lib.speech_rate import project_speech_rate_override
 from lib.text_backends.base import DEFAULT_MAX_OUTPUT_TOKENS, TextGenerationRequest, TextTaskType
 from lib.text_generator import TextGenerator
 from lib.text_utils import strip_json_code_fences
 from server.agent_runtime.sdk_tools._context import (
+    MAX_INSTRUCTIONS_LEN,
     ToolContext,
     fetch_video_caps,
+    read_instructions_arg,
     reference_unit_duration_tiers,
     resolve_video_caps,
     tool_error,
 )
+
+# 四个分集数据生成工具共用的 instructions 参数 schema：用户意见原样注入 prompt 末尾的
+# 「用户意见」分节，遵循强度由正文表达（需要强约束时在正文写明）。
+_INSTRUCTIONS_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "用户对本次生成的意见原文（可选）；原样注入 prompt 末尾的「用户意见」分节，"
+        f"遵循强度由正文表达，缺省/空白视同未传，最长 {MAX_INSTRUCTIONS_LEN} 字符"
+    ),
+}
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +289,7 @@ def generate_episode_script_tool(ctx: ToolContext):
             "type": "object",
             "properties": {
                 "episode": {"type": "integer", "description": "剧集编号"},
+                "instructions": _INSTRUCTIONS_SCHEMA,
                 "dry_run": {"type": "boolean", "description": "仅显示 prompt，不调用模型"},
             },
             "required": ["episode"],
@@ -284,6 +299,9 @@ def generate_episode_script_tool(ctx: ToolContext):
         try:
             episode = int(args["episode"])
             dry_run = bool(args.get("dry_run"))
+            instructions, param_err = read_instructions_arg(args)
+            if param_err is not None:
+                return param_err
 
             project_path = ctx.project_path
             try:
@@ -326,7 +344,7 @@ def generate_episode_script_tool(ctx: ToolContext):
 
             if dry_run:
                 generator = ScriptGenerator(project_path)
-                prompt = await generator.build_prompt(episode)
+                prompt = await generator.build_prompt(episode, instructions=instructions)
                 return {
                     "content": [{"type": "text", "text": f"DRY RUN — 以下是将发送给文本模型的 Prompt:\n\n{prompt}"}]
                 }
@@ -349,7 +367,7 @@ def generate_episode_script_tool(ctx: ToolContext):
                 }
 
             generator = await ScriptGenerator.create(project_path)
-            result_path = await generator.generate(episode=episode)
+            result_path = await generator.generate(episode=episode, instructions=instructions)
             return {"content": [{"type": "text", "text": f"✅ 剧本生成完成: {result_path}"}]}
         except FileNotFoundError as exc:
             return {"content": [{"type": "text", "text": f"❌ 文件错误: {exc}"}], "is_error": True}
@@ -458,6 +476,7 @@ def normalize_drama_script_tool(ctx: ToolContext):
                     "type": "string",
                     "description": "指定小说源文件路径（相对项目目录）；默认读取 source/ 下所有文本",
                 },
+                "instructions": _INSTRUCTIONS_SCHEMA,
                 "dry_run": {"type": "boolean", "description": "仅显示 prompt，不调用模型"},
             },
             "required": ["episode"],
@@ -468,6 +487,9 @@ def normalize_drama_script_tool(ctx: ToolContext):
             episode = int(args["episode"])
             source = args.get("source")
             dry_run = bool(args.get("dry_run"))
+            instructions, param_err = read_instructions_arg(args)
+            if param_err is not None:
+                return param_err
 
             project_path = ctx.project_path
             project = ctx.pm.load_project(ctx.project_name)
@@ -497,9 +519,12 @@ def normalize_drama_script_tool(ctx: ToolContext):
                 # 非中文项目的 step1 内容据此用目标语言产出，而非默认中文。
                 target_language=project.get("source_language") or "中文",
                 # source_language（zh / en / vi 或 None）另供时长下界软指引取语速：drama step1 引导模型为
-                # 每场选不低于该场 utterances 口播时长的档位，语速按此从 lib.speech_rate 单一真相源注入。
+                # 每场选不低于该场 utterances 口播时长的档位，语速按此从 lib.speech_rate 单一真相源注入
+                # （项目级覆盖优先于语言默认）。
                 source_language=project.get("source_language"),
+                speech_rate_override=project_speech_rate_override(project),
             )
+            prompt = append_user_instructions(prompt, instructions)
 
             if dry_run:
                 return {
@@ -531,6 +556,12 @@ def normalize_drama_script_tool(ctx: ToolContext):
             raw_scenes = content.get("scenes")
             if not isinstance(raw_scenes, list) or not raw_scenes:
                 raise ValueError("step1 规范化内容结构异常：scenes 必须是非空的场景对象数组")
+            for scene in raw_scenes:
+                admission = admit_script_unit("scenes", scene, ignore_marker=True)
+                if admission.allowed:
+                    scene.pop("needs_replan", None)
+                else:
+                    scene["needs_replan"] = True
 
             drafts_dir = episode_drafts_dir(project_path, episode)
             drafts_dir.mkdir(parents=True, exist_ok=True)
@@ -688,6 +719,8 @@ def _collect_reference_flat_violations(
     时长档位与正文合并为一个入口：适用哪套档位取决于该 unit 有没有 references，而 references
     正是从正文机械派生的——正文解析不出时无从判档位，此时报出的也只会是同一个问题的另一种说法。
     """
+    # 台词口播量的语速与 prompt 侧同源：项目级覆盖优先，否则按语言默认。
+    speech_rate_override = project_speech_rate_override(project)
     violations: list[DraftViolation] = []
     for index, flat in enumerate(flat_units, start=1):
         label = f"unit E{episode}U{index:02d}"
@@ -704,7 +737,9 @@ def _collect_reference_flat_violations(
                 [
                     lambda la=label, st=source_text: validate_source_text_anchor(la, st, novel_text),
                     _check_text_and_tier,
-                    lambda la=label, tx=text, d=duration: validate_dialogue_load(la, tx, d, source_language),
+                    lambda la=label, tx=text, d=duration: validate_dialogue_load(
+                        la, tx, d, source_language, speech_rate_override
+                    ),
                 ]
             )
         )
@@ -1171,6 +1206,7 @@ def split_reference_video_units_tool(ctx: ToolContext):
                     "type": "string",
                     "description": "指定小说源文件路径（相对项目目录）；默认读取 source/ 下所有文本",
                 },
+                "instructions": _INSTRUCTIONS_SCHEMA,
                 "dry_run": {"type": "boolean", "description": "仅显示 prompt，不调用模型"},
             },
             "required": ["episode"],
@@ -1181,6 +1217,9 @@ def split_reference_video_units_tool(ctx: ToolContext):
             episode = int(args["episode"])
             source = args.get("source")
             dry_run = bool(args.get("dry_run"))
+            instructions, param_err = read_instructions_arg(args)
+            if param_err is not None:
+                return param_err
 
             project_path = ctx.project_path
             project = ctx.pm.load_project(ctx.project_name)
@@ -1214,12 +1253,15 @@ def split_reference_video_units_tool(ctx: ToolContext):
                 episode=episode,
                 # 输出语言取项目 source_language（生成内容语言的唯一真相源），与 normalize 同口径。
                 target_language=project.get("source_language") or "中文",
-                # source_language（zh / en / vi 或 None）另供台词口播时长下界取语速，与后校验同一把尺。
+                # source_language（zh / en / vi 或 None）另供台词口播时长下界取语速（项目级覆盖优先），
+                # 与后校验同一把尺。
                 source_language=project.get("source_language"),
+                speech_rate_override=project_speech_rate_override(project),
                 # 分集大纲约束本集内容边界，同 drama step1。
                 episode_outline=episode_outline,
                 next_episode_outline=next_episode_outline,
             )
+            prompt = append_user_instructions(prompt, instructions)
 
             if dry_run:
                 return {
@@ -1485,6 +1527,7 @@ def split_narration_segments_tool(ctx: ToolContext):
                     "type": "string",
                     "description": "指定小说源文件路径（相对项目目录）；默认读取 source/ 下所有文本",
                 },
+                "instructions": _INSTRUCTIONS_SCHEMA,
                 "dry_run": {"type": "boolean", "description": "仅显示 prompt，不调用模型"},
             },
             "required": ["episode"],
@@ -1495,6 +1538,9 @@ def split_narration_segments_tool(ctx: ToolContext):
             episode = int(args["episode"])
             source = args.get("source")
             dry_run = bool(args.get("dry_run"))
+            instructions, param_err = read_instructions_arg(args)
+            if param_err is not None:
+                return param_err
 
             project_path = ctx.project_path
             project = ctx.pm.load_project(ctx.project_name)
@@ -1526,6 +1572,7 @@ def split_narration_segments_tool(ctx: ToolContext):
                 # 输出语言取项目 source_language（生成内容语言的唯一真相源），与 normalize / reference 同口径。
                 target_language=project.get("source_language") or "中文",
             )
+            prompt = append_user_instructions(prompt, instructions)
 
             if dry_run:
                 return {

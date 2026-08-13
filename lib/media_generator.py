@@ -14,8 +14,12 @@ MediaGenerator 中间层
 """
 
 import asyncio
+import hashlib
 import logging
-from collections.abc import Awaitable, Callable
+import os
+import tempfile
+from collections.abc import Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, cast
 
@@ -37,6 +41,57 @@ from lib.resource_paths import resource_relative_path
 from lib.version_manager import VersionManager
 
 logger = logging.getLogger(__name__)
+
+
+def task_video_staging_path(output_path: Path, task_id: str) -> Path:
+    """Return the bounded, deterministic formal-output path owned by one task."""
+
+    if not isinstance(task_id, str) or not task_id:
+        raise ValueError("formal video output requires a task_id")
+    token = hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+    return output_path.with_name(f".{token}.task-output{output_path.suffix}")
+
+
+def _is_junction(path: Path) -> bool:
+    isjunction = getattr(os.path, "isjunction", None)
+    return bool(isjunction is not None and isjunction(path))
+
+
+def _remove_task_video_staging_path(path: Path) -> None:
+    """Remove a task-owned staging entry without traversing links or arbitrary directories."""
+
+    if path.is_symlink():
+        path.unlink(missing_ok=True)
+    elif _is_junction(path):
+        path.rmdir()
+    elif os.path.lexists(path):
+        if not path.is_file():
+            raise ValueError("formal video staging path is not a regular file")
+        path.unlink()
+
+
+def cleanup_staged_video_output(
+    project_path: Path,
+    resource_type: str,
+    resource_id: str,
+    task_id: str,
+) -> None:
+    """Remove the deterministic interrupted output owned by one video task."""
+
+    output_path = safe_join(project_path, resource_relative_path(resource_type, resource_id))
+    _remove_task_video_staging_path(task_video_staging_path(output_path, task_id))
+
+
+@asynccontextmanager
+async def _remove_staged_output_on_error(path: Path | None):
+    """Remove a formal-output staging file whenever the guarded operation aborts."""
+
+    try:
+        yield
+    except BaseException:
+        if path is not None:
+            path.unlink(missing_ok=True)
+        raise
 
 
 def _is_413(exc: BaseException) -> bool:
@@ -141,6 +196,60 @@ class MediaGenerator:
         self.ledger = Ledger()
 
     @staticmethod
+    def _prepare_video_output(
+        output_path: Path,
+        *,
+        formal_output: bool,
+        task_id: str | None,
+    ) -> tuple[Path | None, Path]:
+        """Return an optional same-directory staging path and the path the backend must write."""
+
+        if not formal_output:
+            return None, output_path
+        if task_id is None:
+            raise ValueError("formal video output requires a task_id")
+        staged_output_path = task_video_staging_path(output_path, task_id)
+        # A process can die after the backend starts writing. Reusing one task-addressable path bounds crash residue
+        # and removes the prior attempt before normal generation or resume writes the same provider result again.
+        _remove_task_video_staging_path(staged_output_path)
+        return staged_output_path, staged_output_path
+
+    def _commit_video_output_version(
+        self,
+        *,
+        resource_type: str,
+        resource_id: str,
+        prompt: str,
+        output_path: Path,
+        staged_output_path: Path | None,
+        duration_seconds: int,
+        version_metadata: Mapping[str, Any],
+    ) -> int:
+        """Register a normal or resumed video through one identical formal-output commit path."""
+
+        if staged_output_path is None:
+            return self.versions.add_version(
+                resource_type=resource_type,
+                resource_id=resource_id,
+                prompt=prompt,
+                source_file=output_path,
+                duration_seconds=duration_seconds,
+                **version_metadata,
+            )
+        try:
+            return self.versions.commit_staged_version(
+                resource_type=resource_type,
+                resource_id=resource_id,
+                prompt=prompt,
+                staged_file=staged_output_path,
+                current_file=output_path,
+                duration_seconds=duration_seconds,
+                **version_metadata,
+            )
+        finally:
+            staged_output_path.unlink(missing_ok=True)
+
+    @staticmethod
     def _sync(coro):
         """Run an async coroutine from synchronous code (e.g. inside to_thread)."""
         try:
@@ -196,6 +305,8 @@ class MediaGenerator:
         specs: "list[ReferenceSpec]",
         provider_id: str | None,
         build_and_call: "Callable[[list[CompressedRef]], Awaitable[Any]]",
+        before_submit: Callable[[], Awaitable[None]] | None = None,
+        provider_resubmit_is_unsafe: Callable[[], bool] | None = None,
     ) -> Any:
         """对参考上传副本做主动压缩 + 预检降档 + 被动 413 兜底，再调用 backend。
 
@@ -209,8 +320,20 @@ class MediaGenerator:
             compressed_reference_payload,
         )
 
+        submit_boundary_crossed = False
+
+        async def _call_once(compressed: "list[CompressedRef]") -> Any:
+            nonlocal submit_boundary_crossed
+            if not submit_boundary_crossed:
+                # Mark before awaiting so cancellation/failure cannot cause a later retry to rewrite an immutable
+                # checkpoint. The caller must abort the whole request when this hook fails.
+                submit_boundary_crossed = True
+                if before_submit is not None:
+                    await before_submit()
+            return await build_and_call(compressed)
+
         if not specs:
-            return await build_and_call([])
+            return await _call_once([])
 
         limits = await self._reference_limits(provider_id)
         step = 0
@@ -222,9 +345,9 @@ class MediaGenerator:
             cm = compressed_reference_payload(specs, limits=limits, start_step=step)
             landed, compressed = await asyncio.to_thread(cm.__enter__)
             try:
-                return await build_and_call(compressed)
+                return await _call_once(compressed)
             except Exception as e:
-                if not _is_413(e):
+                if not _is_413(e) or (provider_resubmit_is_unsafe is not None and provider_resubmit_is_unsafe()):
                     raise
                 # 从「实际落定档位 landed」续档，而非请求值 step——主动预检可能已因字节超限
                 # 降到 landed>step，必须 landed+1 才严格更小、保证降档单调。
@@ -408,6 +531,8 @@ class MediaGenerator:
         voice: str,
         language_type: str = "Chinese",
         speed: float | None = None,
+        before_commit: Callable[[Path], Awaitable[None]] | None = None,
+        commit_staged: Callable[[Path, Path], int] | None = None,
         **version_metadata,
     ) -> tuple[Path, int]:
         """
@@ -432,51 +557,65 @@ class MediaGenerator:
         output_path = self._get_output_path(resource_type, resource_id)
         self._ensure_parent_dir(output_path)
 
-        # 若已存在，确保旧文件被记录
-        if output_path.exists():
-            self.versions.ensure_current_tracked(
-                resource_type=resource_type,
-                resource_id=resource_id,
-                current_file=output_path,
-                prompt=text,
-                **version_metadata,
-            )
-
         if self._audio_backend is None:
             raise RuntimeError("audio_backend not configured")
 
+        # 后端只写同目录唯一 staging 文件。只有同步合成完整成功且确实产出普通文件后，
+        # 才以原子 replace 提升为 canonical；失败或取消均不会触碰旧付费音频。
+        fd, staged_name = tempfile.mkstemp(
+            prefix=f".{output_path.stem}.",
+            suffix=output_path.suffix,
+            dir=output_path.parent,
+        )
+        os.close(fd)
+        staged_path = Path(staged_name)
+        staged_path.unlink()
+
         # audio 合成字符数 → 计费 token 的语义转写已收进 ledger union 分发（_settlement_from_result），
         # 此处仅把 backend 结果对象递交给 call.success。
-        async with self.ledger.record(
-            project_name=self.project_name,
-            call_type="audio",
-            model=self._audio_backend.model,
-            prompt=text,
-            # 记账 provider 取解析层 provider_id；成对不变量保证 backend 非 None 时 provider_id 亦非 None。
-            provider=cast(str, self._audio_provider_id),
-            user_id=self._user_id,
-            segment_id=segment_id_for("audio", resource_type, resource_id),
-            output_path=str(output_path),
-        ) as call:
-            request = AudioSynthesisRequest(
-                text=text,
-                output_path=output_path,
-                voice=voice,
-                language_type=language_type,
-                speed=speed,
-            )
-            result = await self._audio_backend.synthesize(request)
-            call.success(result)
+        try:
+            async with self.ledger.record(
+                project_name=self.project_name,
+                call_type="audio",
+                model=self._audio_backend.model,
+                prompt=text,
+                # 记账 provider 取解析层 provider_id；成对不变量保证 backend 非 None 时 provider_id 亦非 None。
+                provider=cast(str, self._audio_provider_id),
+                user_id=self._user_id,
+                segment_id=segment_id_for("audio", resource_type, resource_id),
+                output_path=str(output_path),
+            ) as call:
+                request = AudioSynthesisRequest(
+                    text=text,
+                    output_path=staged_path,
+                    voice=voice,
+                    language_type=language_type,
+                    speed=speed,
+                )
+                result = await self._audio_backend.synthesize(request)
+                if not staged_path.is_file():
+                    raise RuntimeError("audio backend completed without a regular output file")
+                call.success(result)
 
-        new_version = self.versions.add_version(
-            resource_type=resource_type,
-            resource_id=resource_id,
-            prompt=text,
-            source_file=output_path,
-            **version_metadata,
-        )
-
-        return output_path, new_version
+            if before_commit is not None:
+                await before_commit(staged_path)
+            commit = commit_staged
+            if commit is None:
+                version = self.versions.commit_staged_version(
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    prompt=text,
+                    staged_file=staged_path,
+                    current_file=output_path,
+                    **version_metadata,
+                )
+            else:
+                version = commit(staged_path, output_path)
+            if not output_path.is_file():
+                raise RuntimeError("audio commit completed without a regular formal output file")
+            return output_path, version
+        finally:
+            staged_path.unlink(missing_ok=True)
 
     def generate_video(
         self,
@@ -546,6 +685,8 @@ class MediaGenerator:
         duration_seconds: str | int = "8",
         resolution: str | None = None,
         task_id: str | None = None,
+        before_submit: Callable[[int], Awaitable[Mapping[str, object] | None]] | None = None,
+        formal_output: bool = False,
         **version_metadata,
     ) -> tuple[Path, int, Any, str | None]:
         """
@@ -565,6 +706,9 @@ class MediaGenerator:
             aspect_ratio: 宽高比，默认 9:16（竖屏）
             duration_seconds: 视频时长，可选 "4", "6", "8"
             resolution: 分辨率，默认不传（由 backend/SDK 决定）
+            before_submit: 首次 provider 提交紧前执行一次的异步持久化钩子；
+                返回值并入当次版本元数据
+            formal_output: 将 provider 产物先写入同目录临时文件，成功后再与版本历史一起提交
             **version_metadata: 额外元数据
 
         Returns:
@@ -583,15 +727,16 @@ class MediaGenerator:
         except (ValueError, TypeError):
             duration_int = 8
 
-        # 1. 若已存在，确保旧文件被记录
-        if output_path.exists():
+        # 1. 若已存在，确保旧文件被记录。这里的 prompt / duration / provider 选项都属于即将
+        # 发起的新请求，不能写到来源不明的 legacy current 上；否则新产物被拒绝回滚后，旧视频
+        # 会冒充新请求档位，后续被错误地当作可复用成片。未知事实保持未知，新产物在 add_version
+        # 时再登记完整请求元数据。
+        if output_path.exists() and not formal_output:
             self.versions.ensure_current_tracked(
                 resource_type=resource_type,
                 resource_id=resource_id,
                 current_file=output_path,
-                prompt=prompt,
-                duration_seconds=duration_int,
-                **version_metadata,
+                prompt="",
             )
 
         if self._video_backend is None:
@@ -608,7 +753,12 @@ class MediaGenerator:
 
         # 能力校验与槽位组装先于记账括号：能力不被支持时硬失败要"不扣费"，
         # 在括号内抛虽也不结算，却会留一条 failed ApiCall 行；两者均无副作用，前置最干净。
-        from lib.video_frame_slots import gate_video_request, plan_frame_slots, resolve_video_capabilities
+        from lib.video_frame_slots import (
+            gate_video_request,
+            plan_frame_slots,
+            resolve_first_frame_aspect_ratio,
+            resolve_video_capabilities,
+        )
 
         # prompt 长度校验对每个请求都适用（不像尾帧/参考图/参考音频那样可选），故能力查询不再
         # 按可选路径惰性触发。查询是纯读后端声明的同步调用，没有 I/O 开销。
@@ -643,6 +793,13 @@ class MediaGenerator:
             end_image=end_image,
             reference_images=reference_images,
         )
+        # 仅声明 first_frame_ratio_adaptive_only 的后端受影响；下发值与调用方持有的原始
+        # aspect_ratio（记账、分镜图生成沿用）分离，不回写覆盖上游变量。
+        request_aspect_ratio = resolve_first_frame_aspect_ratio(
+            caps=video_caps,
+            aspect_ratio=aspect_ratio,
+            has_first_frame=slot_plan.start_index is not None,
+        )
 
         if self._config is not None:
             configured_generate_audio = await self._config.video_generate_audio(self.project_name)
@@ -652,26 +809,35 @@ class MediaGenerator:
             configured_generate_audio = ConfigResolver._DEFAULT_VIDEO_GENERATE_AUDIO
         effective_generate_audio = version_metadata.get("generate_audio", configured_generate_audio)
 
+        staged_output_path, backend_output_path = self._prepare_video_output(
+            output_path,
+            formal_output=formal_output,
+            task_id=task_id,
+        )
+
         # video 实际计费时长（result.duration_seconds）覆盖请求时长的语义转写已收进 ledger union
         # 分发（_settlement_from_result），此处仅递交 backend 结果对象。
         video_ref = None
         video_uri: str | None = None
-        async with self.ledger.record(
-            project_name=self.project_name,
-            call_type="video",
-            model=model_name,
-            prompt=prompt,
-            resolution=resolution,
-            duration_seconds=duration_int,
-            aspect_ratio=aspect_ratio,
-            generate_audio=effective_generate_audio,
-            # 记账 provider 取解析层 provider_id；成对不变量保证 backend 非 None 时 provider_id 亦非 None。
-            provider=cast(str, self._video_provider_id),
-            user_id=self._user_id,
-            segment_id=segment_id_for("video", resource_type, resource_id),
-            service_tier=version_metadata.get("service_tier", "default"),
-            output_path=str(output_path),
-        ) as call:
+        async with (
+            _remove_staged_output_on_error(staged_output_path),
+            self.ledger.record(
+                project_name=self.project_name,
+                call_type="video",
+                model=model_name,
+                prompt=prompt,
+                resolution=resolution,
+                duration_seconds=duration_int,
+                aspect_ratio=aspect_ratio,
+                generate_audio=effective_generate_audio,
+                # 记账 provider 取解析层 provider_id；成对不变量保证 backend 非 None 时 provider_id 亦非 None。
+                provider=cast(str, self._video_provider_id),
+                user_id=self._user_id,
+                segment_id=segment_id_for("video", resource_type, resource_id),
+                service_tier=version_metadata.get("service_tier", "default"),
+                output_path=str(output_path),
+            ) as call,
+        ):
             # 拿到 call_id 后立即写入 task.payload["api_call_id"]，让 worker 崩溃重启后 resume
             # 路径能精准翻这条 pending ApiCall 行（而不是按 segment_id+LIMIT 1 模糊匹配）。
             # fail-fast 抛异常会被记账括号翻 pending → failed 后再重抛，避免留下永久 pending
@@ -690,6 +856,11 @@ class MediaGenerator:
             start_spec_idx = slot_plan.start_index
             end_spec_idx = slot_plan.end_index
             ref_start_idx = slot_plan.reference_start_index
+            provider_resubmit_unsafe = False
+
+            def _mark_provider_resubmit_unsafe() -> None:
+                nonlocal provider_resubmit_unsafe
+                provider_resubmit_unsafe = True
 
             def _call_video(compressed: "list[CompressedRef]"):
                 start_arg = compressed[start_spec_idx].path if start_spec_idx is not None else None
@@ -702,8 +873,8 @@ class MediaGenerator:
                 return video_backend.generate(
                     VideoGenerationRequest(
                         prompt=prompt,
-                        output_path=output_path,
-                        aspect_ratio=aspect_ratio,
+                        output_path=backend_output_path,
+                        aspect_ratio=request_aspect_ratio,
                         duration_seconds=duration_int,
                         resolution=resolution,
                         start_image=start_arg,
@@ -718,27 +889,42 @@ class MediaGenerator:
                         generate_audio=effective_generate_audio,
                         project_name=self.project_name,
                         task_id=task_id,
+                        on_provider_resubmit_unsafe=_mark_provider_resubmit_unsafe,
                         service_tier=version_metadata.get("service_tier", "default"),
                         seed=version_metadata.get("seed"),
                     )
                 )
 
-            result = await self._run_with_reference_compression(
-                specs=specs,
-                provider_id=self._video_provider_id,
-                build_and_call=_call_video,
-            )
+            async def _before_first_submit() -> None:
+                if before_submit is not None:
+                    checkpoint_metadata = await before_submit(call.call_id)
+                    if checkpoint_metadata is not None:
+                        version_metadata.update(checkpoint_metadata)
+
+            try:
+                result = await self._run_with_reference_compression(
+                    specs=specs,
+                    provider_id=self._video_provider_id,
+                    build_and_call=_call_video,
+                    before_submit=_before_first_submit if before_submit is not None else None,
+                    provider_resubmit_is_unsafe=lambda: provider_resubmit_unsafe,
+                )
+            except BaseException:
+                if staged_output_path is not None:
+                    staged_output_path.unlink(missing_ok=True)
+                raise
             video_uri = result.video_uri
             call.success(result)
 
         # 5. 记录新版本
-        new_version = self.versions.add_version(
+        new_version = self._commit_video_output_version(
             resource_type=resource_type,
             resource_id=resource_id,
             prompt=prompt,
-            source_file=output_path,
+            output_path=output_path,
+            staged_output_path=staged_output_path,
             duration_seconds=duration_int,
-            **version_metadata,
+            version_metadata=version_metadata,
         )
 
         return output_path, new_version, video_ref, video_uri
@@ -755,6 +941,8 @@ class MediaGenerator:
         resolution: str | None = None,
         task_id: str | None = None,
         api_call_id: int | None = None,
+        submitted_base_url: str | None = None,
+        formal_output: bool = False,
         **version_metadata,
     ) -> tuple[Path, int, Any, str | None]:
         """接续 provider 上已发起的 video job：调 backend.resume_video 而非 generate。
@@ -763,10 +951,11 @@ class MediaGenerator:
         - 不开记账括号（不落新 pending 行）—— 首次 submit 已记账；ResumeExpired / crash window
           都不应再写 ApiCall（防双重扣费）。caller 透传 ``api_call_id`` 时经 ledger.resume_success
           / resume_failed 按 call_id 精准翻 pending → success/failed；不透传则 logger.warning 不阻断。
-        - resume 成功后总是 add_version 记录新版本：无论 versions.json 是否已有历史版本，
-          backend.resume_video 都会下载新视频并覆盖 output_path，必须 bump 一个新版本号
-          让 versions.json 与磁盘文件一致；否则会漏记本次重新生成的视频，回滚记录失真。
+        - resume 成功后总是记录新版本；``formal_output=True`` 时先下载到
+          同目录临时文件，再与版本历史一起提交，不提前覆盖 current。
         - prompt / start_image / reference_images 仅用于日志/版本元数据，不影响 provider 端结果。
+        - ``submitted_base_url`` 是具名参数而非 version_metadata：它是提交时域名的回放值、
+          只喂给 backend 轮询，落进版本元数据会污染 versions.json。
 
         Returns: (output_path, version_number, video_ref, video_uri) 四元组。
         """
@@ -793,11 +982,17 @@ class MediaGenerator:
             configured_generate_audio = ConfigResolver._DEFAULT_VIDEO_GENERATE_AUDIO
         effective_generate_audio = version_metadata.get("generate_audio", configured_generate_audio)
 
+        staged_output_path, backend_output_path = self._prepare_video_output(
+            output_path,
+            formal_output=formal_output,
+            task_id=task_id,
+        )
+
         from lib.video_backends.base import ResumeExpiredError, VideoGenerationRequest
 
         request = VideoGenerationRequest(
             prompt=prompt,
-            output_path=output_path,
+            output_path=backend_output_path,
             aspect_ratio=aspect_ratio,
             duration_seconds=duration_int,
             resolution=resolution,
@@ -806,6 +1001,7 @@ class MediaGenerator:
             task_id=task_id,
             service_tier=version_metadata.get("service_tier", "default"),
             seed=version_metadata.get("seed"),
+            submitted_base_url=submitted_base_url,
         )
 
         try:
@@ -815,11 +1011,18 @@ class MediaGenerator:
             # cost_amount=0 不增加计费（resume 不重扣，符合 "不主动扣费" 红线）。
             # finalize 失败时不吞异常，让 worker finally 走 mark_failed 兜底，避免 ApiCall
             # 永久卡 pending 导致 usage 报表/补账缺口（与 persist_api_call_id 的 fail-fast 一致）。
-            if api_call_id is not None:
-                await self.ledger.resume_failed(call_id=api_call_id)
+            async with _remove_staged_output_on_error(staged_output_path):
+                if api_call_id is not None:
+                    await self.ledger.resume_failed(call_id=api_call_id)
+                raise
+        except asyncio.CancelledError:
+            if staged_output_path is not None:
+                staged_output_path.unlink(missing_ok=True)
             raise
         except Exception:
             logger.exception("resume 失败 (video) task_id=%s job_id=%s", task_id, job_id)
+            if staged_output_path is not None:
+                staged_output_path.unlink(missing_ok=True)
             raise
 
         video_ref = None
@@ -831,11 +1034,12 @@ class MediaGenerator:
         # 永久漏记。service_tier 由 caller 透传（ApiCall 模型无该列），让非 default 档位按真实档
         # 计费。finalize 自身异常不吞，交 worker finally 兜底；WHERE status='pending' 保护幂等性。
         if api_call_id is not None:
-            await self.ledger.resume_success(
-                call_id=api_call_id,
-                result=result,
-                service_tier=version_metadata.get("service_tier", "default"),
-            )
+            async with _remove_staged_output_on_error(staged_output_path):
+                await self.ledger.resume_success(
+                    call_id=api_call_id,
+                    result=result,
+                    service_tier=version_metadata.get("service_tier", "default"),
+                )
         else:
             logger.warning(
                 "resume 缺 api_call_id task_id=%s job_id=%s (旧任务未持久化 payload)",
@@ -847,13 +1051,14 @@ class MediaGenerator:
         # - versions.json 空时（submit→poll 中崩）add_version 直接登记 v1，避免下游 versions[-1] IndexError；
         # - versions.json 已有 v_n（覆盖式重新生成）时 add_version 登记 v_(n+1)，避免 output_path
         #   被新内容覆盖却仍报旧版本号导致 versions.json 与磁盘文件错位。
-        new_version = self.versions.add_version(
+        new_version = self._commit_video_output_version(
             resource_type=resource_type,
             resource_id=resource_id,
             prompt=prompt,
-            source_file=output_path,
+            output_path=output_path,
+            staged_output_path=staged_output_path,
             duration_seconds=duration_int,
-            **version_metadata,
+            version_metadata=version_metadata,
         )
 
         return output_path, new_version, video_ref, video_uri

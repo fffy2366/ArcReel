@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Route, Router } from "wouter";
 import { memoryLocation } from "wouter/memory-location";
-import { API } from "@/api";
+import { API, NarratedVideoDurationError } from "@/api";
 import { useAppStore } from "@/stores/app-store";
 import { useConfigStatusStore } from "@/stores/config-status-store";
 import { useProjectsStore } from "@/stores/projects-store";
@@ -98,41 +98,29 @@ vi.mock("./EpisodeSourceReview", () => ({
   ),
 }));
 
-vi.mock("./reference/AdReferenceVideoCanvas", () => ({
-  AdReferenceVideoCanvas: ({
-    shots,
+vi.mock("./reference/ReferenceVideoCanvas", () => ({
+  ReferenceVideoCanvas: ({
     hasScript,
     canEditTitle,
     onSaveTitle,
-    onUpdatePrompt,
+    showPreprocess,
+    freeDuration,
   }: {
-    shots: { shot_id: string }[];
     hasScript: boolean;
     canEditTitle?: boolean;
     onSaveTitle?: (title: string) => Promise<void>;
-    onUpdatePrompt?: (...args: unknown[]) => Promise<boolean> | void;
+    showPreprocess?: boolean;
+    freeDuration?: boolean;
   }) => (
     <div
-      data-testid="ad-reference-canvas"
+      data-testid="reference-video-canvas"
       data-has-script={hasScript ? "yes" : "no"}
-      data-editable={onUpdatePrompt ? "yes" : "no"}
+      data-preprocess={showPreprocess === false ? "no" : "yes"}
+      data-free-duration={freeDuration ? "yes" : "no"}
     >
-      <div data-testid="ad-reference-can-edit-title">{canEditTitle ? "yes" : "no"}</div>
-      {shots.map((s) => s.shot_id).join(",")}
+      <div data-testid="reference-can-edit-title">{canEditTitle ? "yes" : "no"}</div>
       <button onClick={() => void onSaveTitle?.("新标题")?.catch(() => {})}>
-        ad-reference-save-title
-      </button>
-      <button
-        onClick={(e) => {
-          const el = e.currentTarget;
-          void Promise.resolve(
-            onUpdatePrompt?.("SEG-1", { duration_seconds: 7 }, undefined, "episode_1.json"),
-          ).then((result) => {
-            el.setAttribute("data-update-result", String(result));
-          });
-        }}
-      >
-        ad-reference-update-prompt
+        reference-save-title
       </button>
     </div>
   ),
@@ -141,15 +129,39 @@ vi.mock("./reference/AdReferenceVideoCanvas", () => ({
 vi.mock("./grid/GridImageToVideoCanvas", () => ({
   GridImageToVideoCanvas: ({
     onGenerateGrid,
+    onGenerateVideo,
   }: {
     onGenerateGrid?: (
       episode: number,
       scriptFile: string,
       sceneIds?: string[],
     ) => void | Promise<void>;
+    onGenerateVideo?: (
+      segmentId: string,
+      scriptFile?: string,
+      requestOptions?: { narration_delivery: "use_tts" },
+    ) => void | Promise<void>;
   }) => (
     <div data-testid="grid-canvas">
       <button onClick={() => void onGenerateGrid?.(1, "episode_1.json")}>generate-grid</button>
+      <button
+        onClick={(event) => {
+          const button = event.currentTarget;
+          button.dataset.videoResult = "pending";
+          void Promise.resolve(
+            onGenerateVideo?.("SEG-1", "episode_1.json", { narration_delivery: "use_tts" }),
+          ).then(
+            () => {
+              button.dataset.videoResult = "resolved";
+            },
+            (error: unknown) => {
+              button.dataset.videoResult = error instanceof Error ? error.name : "unknown";
+            },
+          );
+        }}
+      >
+        generate-grid-video-await
+      </button>
     </div>
   ),
 }));
@@ -558,6 +570,7 @@ describe("StudioCanvasRouter", () => {
               duration_resolution_constraints: {},
               resolutions: [],
               has_audio_track: false,
+              audio_switch_controllable: true,
               voice_consistency: "none",
             },
           },
@@ -628,6 +641,7 @@ describe("StudioCanvasRouter", () => {
               reference_image_durations: [8],
               resolutions: ["720p", "1080p"],
               has_audio_track: true,
+              audio_switch_controllable: true,
               voice_consistency: "soft",
             },
           },
@@ -1207,33 +1221,6 @@ describe("StudioCanvasRouter", () => {
     expect(updateSegmentSpy).not.toHaveBeenCalled();
   });
 
-  // PATCH 成功但本地刷新失败/取消时不能报告成功：调用方（AdReferenceVideoCanvas 的
-  // 镜头编辑）会据此清空本地草稿，届时 store 里仍是旧剧本，回显会与用户刚提交的值不符。
-  // 与 handleMoveShot 的既有契约（"moves an ad shot..." 用例）保持一致。
-  it("reports the shot PATCH as failed when the local refresh doesn't land", async () => {
-    useProjectsStore.setState({
-      currentProjectName: "demo",
-      currentProjectData: makeProjectData({
-        content_mode: "ad",
-        generation_mode: "reference_video",
-      }),
-      currentScripts: { "episode_1.json": makeAdScript() },
-    });
-
-    vi.spyOn(API, "updateShot").mockResolvedValue({ success: true });
-    vi.spyOn(API, "getProject").mockRejectedValue(new Error("network down"));
-
-    renderAt("/episodes/1");
-
-    fireEvent.click(screen.getByText("ad-reference-update-prompt"));
-    await waitFor(() => {
-      expect(screen.getByText("ad-reference-update-prompt")).toHaveAttribute(
-        "data-update-result",
-        "false",
-      );
-    });
-  });
-
   it("moves an ad shot by submitting the full reordered id list", async () => {
     const script = makeAdScript() as AdEpisodeScript;
     script.shots.push({
@@ -1332,7 +1319,7 @@ describe("StudioCanvasRouter", () => {
     });
   });
 
-  it("routes ad + reference_video projects to the derived-group canvas with the script's shots", async () => {
+  it("routes ad + reference_video projects to the unified unit canvas without preprocessing", async () => {
     useProjectsStore.setState({
       currentProjectName: "demo",
       currentProjectData: makeProjectData({
@@ -1349,41 +1336,22 @@ describe("StudioCanvasRouter", () => {
 
     renderAt("/episodes/1");
 
-    const canvas = screen.getByTestId("ad-reference-canvas");
+    const canvas = screen.getByTestId("reference-video-canvas");
     expect(canvas).toHaveAttribute("data-has-script", "yes");
-    expect(canvas).toHaveTextContent("SEG-1");
+    expect(canvas).toHaveAttribute("data-preprocess", "no");
+    expect(canvas).toHaveAttribute("data-free-duration", "yes");
     // 分镜编辑画布在该路径下不再渲染
     expect(screen.queryByTestId("timeline-canvas")).not.toBeInTheDocument();
     // script_file 存在 → 标题可编辑入口透传为 true
-    expect(screen.getByTestId("ad-reference-can-edit-title")).toHaveTextContent("yes");
+    expect(screen.getByTestId("reference-can-edit-title")).toHaveTextContent("yes");
 
-    fireEvent.click(screen.getByText("ad-reference-save-title"));
+    fireEvent.click(screen.getByText("reference-save-title"));
     await waitFor(() => {
       expect(API.updateEpisode).toHaveBeenCalledWith("demo", 1, { title: "新标题" });
     });
   });
 
-  // 演示项目当前的 content_mode 恒为 narration，不会真的落到这条路由分支；本用例直接摆出
-  // demoMode + ad + reference_video 的组合，核对调用点本身的门控独立于「当前是否可达」——
-  // 与其余画布一致，demoMode 下不得把写入回调暴露给子组件。
-  it("does not expose the edit callback to the derived-group canvas in demo mode", () => {
-    useProjectsStore.setState({
-      currentProjectName: DEMO_PROJECT_NAME,
-      currentProjectData: makeProjectData({
-        content_mode: "ad",
-        generation_mode: "reference_video",
-      }),
-      currentScripts: { "episode_1.json": makeAdScript() },
-    });
-
-    renderAt("/episodes/1");
-
-    expect(screen.getByTestId("ad-reference-canvas")).toHaveAttribute("data-editable", "no");
-  });
-
-  it("falls back to an empty shot list when the episode script isn't an ad script", () => {
-    // 路由分支只按 project.content_mode 判定 isAd；剧本条目理应与项目模式一致，
-    // 但类型上是各自独立的 union，ternary 的 : [] 分支正是应对二者暂时不一致的防御。
+  it("uses the unified unit canvas even when project and script content modes temporarily differ", () => {
     useProjectsStore.setState({
       currentProjectName: "demo",
       currentProjectData: makeProjectData({
@@ -1399,9 +1367,9 @@ describe("StudioCanvasRouter", () => {
 
     renderAt("/episodes/1");
 
-    const canvas = screen.getByTestId("ad-reference-canvas");
+    const canvas = screen.getByTestId("reference-video-canvas");
     expect(canvas).toHaveAttribute("data-has-script", "yes");
-    expect(canvas).not.toHaveTextContent("SEG-1");
+    expect(canvas).toHaveAttribute("data-preprocess", "no");
   });
 
   it("keeps ad + storyboard projects on the shot editor", () => {
@@ -1418,7 +1386,7 @@ describe("StudioCanvasRouter", () => {
     renderAt("/episodes/1");
 
     expect(screen.getByTestId("timeline-canvas")).toBeInTheDocument();
-    expect(screen.queryByTestId("ad-reference-canvas")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("reference-video-canvas")).not.toBeInTheDocument();
   });
 
   it("resolves drama scenes by scene_id when generating storyboard", async () => {
@@ -1680,6 +1648,61 @@ describe("StudioCanvasRouter", () => {
       expect(useAppStore.getState().toast?.text).toContain("宫格生成失败");
       expect(useAppStore.getState().toast?.tone).toBe("error");
     });
+  });
+
+  it("preserves the grid video promise for duration confirmation", async () => {
+    const projectData = makeProjectData({ generation_mode: "storyboard", grid_storyboard: true });
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: projectData,
+      currentScripts: { "episode_1.json": makeScript() },
+    });
+    vi.spyOn(API, "getProject").mockResolvedValue({
+      project: projectData,
+      scripts: { "episode_1.json": makeScript() },
+    });
+    vi.spyOn(API, "generateVideo").mockRejectedValue(
+      new NarratedVideoDurationError({
+        allowed: false,
+        kind: "narrated_video_duration",
+        unit_id: "SEG-1",
+        narration_delivery: {},
+        planned_duration: 4,
+        duration_input: 6.2,
+        request_duration: 8,
+        adjustment: "up",
+        problems: [
+          {
+            code: "reference_duration_confirmation_required",
+            blocking: true,
+            unit_id: "SEG-1",
+            locations: [{ path: ["duration_seconds"], line: null }],
+            params: { duration_input: 6.2, request_duration: 8 },
+            reason: "request_duration_uses_different_tier",
+            action: "confirm_duration",
+            message: "本次时长基准 6.2s 将按 8s 档位生成，请确认后重试",
+          },
+        ],
+      }),
+    );
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    renderAt("/episodes/1");
+
+    const button = await screen.findByText("generate-grid-video-await");
+    fireEvent.click(button);
+
+    await waitFor(() => {
+      expect(button).toHaveAttribute("data-video-result", "NarratedVideoDurationError");
+    });
+    expect(API.generateVideo).toHaveBeenCalledWith(
+      "demo",
+      "SEG-1",
+      "video prompt",
+      "episode_1.json",
+      4,
+      { narration_delivery: "use_tts" },
+    );
   });
 
   it("marks the scriptFile as optimistically active on grid generation submit success", async () => {

@@ -17,6 +17,7 @@ from typing import Any
 from claude_agent_sdk import create_sdk_mcp_server
 
 from server.agent_runtime.sdk_tools._context import ToolContext
+from server.agent_runtime.sdk_tools.asset_inventory import complete_asset_inventory_tool
 from server.agent_runtime.sdk_tools.enqueue_assets import (
     generate_assets_tool,
     list_pending_assets_tool,
@@ -38,11 +39,13 @@ from server.agent_runtime.sdk_tools.episode_planning import (
 from server.agent_runtime.sdk_tools.patch_episode_meta import patch_episode_meta_tool
 from server.agent_runtime.sdk_tools.patch_project import patch_project_tool
 from server.agent_runtime.sdk_tools.patch_script import (
+    get_episode_script_revision_tool,
     insert_segment_tool,
     patch_episode_script_tool,
     remove_segment_tool,
     split_segment_tool,
 )
+from server.agent_runtime.sdk_tools.rename_asset import rename_asset_tool
 from server.agent_runtime.sdk_tools.text_generation import (
     confirm_script_review_tool,
     generate_episode_script_tool,
@@ -53,6 +56,7 @@ from server.agent_runtime.sdk_tools.text_generation import (
     split_reference_video_units_tool,
     validate_and_promote_reference_draft_tool,
 )
+from server.agent_runtime.sdk_tools.workflow_status import complete_step1_rebuild_tool, get_workflow_status_tool
 
 __all__ = ["build_arcreel_mcp_server", "ToolContext", "ARCREEL_MCP_TOOL_IDS"]
 
@@ -64,6 +68,9 @@ __all__ = ["build_arcreel_mcp_server", "ToolContext", "ARCREEL_MCP_TOOL_IDS"]
 # here has a translation in all locales, so adding a tool without wiring up
 # i18n fails CI.
 ARCREEL_MCP_TOOL_IDS: tuple[str, ...] = (
+    "complete_asset_inventory",
+    "complete_step1_rebuild",
+    "get_workflow_status",
     "list_pending_assets",
     "generate_assets",
     "generate_storyboards",
@@ -84,12 +91,14 @@ ARCREEL_MCP_TOOL_IDS: tuple[str, ...] = (
     "get_video_capabilities",
     "plan_episodes",
     "reset_episode_planning",
+    "get_episode_script_revision",
     "patch_episode_script",
     "patch_episode_meta",
     "insert_segment",
     "remove_segment",
     "split_segment",
     "patch_project",
+    "rename_asset",
 )
 
 
@@ -100,6 +109,9 @@ def build_arcreel_mcp_server(*, project_name: str, projects_root: Path) -> Any:
         name="arcreel",
         version="1.0.0",
         tools=[
+            complete_asset_inventory_tool(ctx),
+            complete_step1_rebuild_tool(ctx),
+            get_workflow_status_tool(ctx),
             list_pending_assets_tool(ctx),
             generate_assets_tool(ctx),
             generate_storyboards_tool(ctx),
@@ -120,11 +132,13 @@ def build_arcreel_mcp_server(*, project_name: str, projects_root: Path) -> Any:
             get_video_capabilities_tool(ctx),
             plan_episodes_tool(ctx),
             reset_episode_planning_tool(ctx),
+            get_episode_script_revision_tool(ctx),
             patch_episode_script_tool(ctx),
             patch_episode_meta_tool(ctx),
             insert_segment_tool(ctx),
             remove_segment_tool(ctx),
             split_segment_tool(ctx),
             patch_project_tool(ctx),
+            rename_asset_tool(ctx),
         ],
     )

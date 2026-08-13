@@ -7,7 +7,10 @@ Single-file fakes stay in their respective test modules.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+from instructor.core import InstructorRetryException
 
 if TYPE_CHECKING:
     from lib.reference_video.voice_settings import VoiceRenderSettings
@@ -184,6 +187,95 @@ class FakeImageBackend:
         )
 
 
+class FakeReferenceCapabilityProjection:
+    """Configurable provider capability adapter for reference projection tests."""
+
+    def __init__(
+        self,
+        *,
+        durations: tuple[int, ...],
+        provider_id: str = "fake",
+        model_id: str = "fake-model",
+        max_reference_images: int | None = 9,
+    ) -> None:
+        self.durations = durations
+        self.provider_id = provider_id
+        self.model_id = model_id
+        self.max_reference_images = max_reference_images
+
+    async def resolve_candidate(self, project: dict, capability):
+        from lib.reference_video.request_projection import ProviderProjectionCandidate
+
+        del project
+        return ProviderProjectionCandidate(
+            capability=capability,
+            provider_id=self.provider_id,
+            model_id=self.model_id,
+            supported_durations=self.durations,
+            max_reference_images=self.max_reference_images,
+            resolution="1080p",
+            generate_audio=True,
+            requested_generate_audio=True,
+            has_audio_track=True,
+            audio_switch_controllable=True,
+        )
+
+
+def fake_reference_request_projector(
+    *,
+    durations: tuple[int, ...] | None = None,
+    provider_id: str = "fake",
+    model_id: str = "fake-model",
+    max_reference_images: int | None = 9,
+    capabilities: FakeReferenceCapabilityProjection | None = None,
+):
+    """构造使用真实资产水合与投影规则、仅替换 provider 能力查询的 async 测试入口。"""
+
+    from lib.reference_video.request_projection import (
+        FilesystemReferenceAssets,
+        ReferenceRequestOptions,
+        ReferenceUnitRequestProjection,
+        ReferenceUnitRequestProjector,
+        resolve_reference_assets,
+    )
+
+    if capabilities is not None:
+        if durations is not None or provider_id != "fake" or model_id != "fake-model" or max_reference_images != 9:
+            raise ValueError("capabilities cannot be combined with candidate construction fields")
+        projection_capabilities = capabilities
+    else:
+        if durations is None:
+            raise ValueError("durations are required when capabilities are not supplied")
+        projection_capabilities = FakeReferenceCapabilityProjection(
+            durations=durations,
+            provider_id=provider_id,
+            model_id=model_id,
+            max_reference_images=max_reference_images,
+        )
+
+    async def _project(
+        *,
+        project: dict,
+        script: dict,
+        unit: dict,
+        project_path: Path,
+        options: ReferenceRequestOptions | None = None,
+        **_kwargs: object,
+    ) -> ReferenceUnitRequestProjection:
+        return await ReferenceUnitRequestProjector(
+            projection_capabilities,
+            FilesystemReferenceAssets(project_path),
+        ).project_current(
+            project=project,
+            script=script,
+            unit=unit,
+            resolved_assets=resolve_reference_assets(project, project_path, unit),
+            options=options,
+        )
+
+    return _project
+
+
 def fake_reference_caps_fetcher(
     *,
     default_duration: int | None = 4,
@@ -220,3 +312,23 @@ def fake_reference_caps_fetcher(
         )
 
     return _fetch
+
+
+def instructor_api_call_exhausted(cause: Exception) -> InstructorRetryException:
+    """构造「API 调用失败」形态的 Instructor 异常，供结构化输出降级链的判据测试使用。
+
+    API 调用本身抛的异常（参数被拒、瞬态 5xx、连接错误）会中断档内重试循环、被包成
+    ``InstructorRetryException``，原异常只挂在 ``__cause__`` 上。降级链的判据要认的正是这个
+    形态，拿裸 API 异常做桩会测出生产里不存在的路径。此处 ``failed_attempts`` 为空表示这一档
+    一次都没走到解析；先解析失败若干次再折在 API 上的混合形态由测试模块自行构造。形态本身由
+    ``TestInstructorExceptionShape`` 对真实 Instructor 钉住。
+    """
+    exc = InstructorRetryException(
+        str(cause),
+        last_completion=None,
+        n_attempts=1,
+        total_usage=0,
+        failed_attempts=[],
+    )
+    exc.__cause__ = cause
+    return exc

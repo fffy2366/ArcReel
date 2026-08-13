@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -14,6 +14,7 @@ from typing import Protocol
 import httpx
 from sqlalchemy.exc import InterfaceError, OperationalError
 
+from lib.data_uri import file_to_data_uri
 from lib.retry import BASE_RETRYABLE_ERRORS, _should_retry, with_retry_async
 
 # `_should_retry` 默认会做字符串模式兜底（"timeout"/"503" 等），
@@ -40,21 +41,31 @@ _PERSIST_BACKOFF_SECONDS: tuple[int, ...] = (1, 2, 4)
     backoff_seconds=_PERSIST_BACKOFF_SECONDS,
     retry_if=lambda e: isinstance(e, _PERSIST_RETRYABLE_ERRORS),
 )
-async def _persist_with_retry(task_id: str, job_id: str, endpoint: str | None) -> None:
+async def _persist_with_retry(task_id: str, job_id: str, endpoint: str | None, base_url: str | None) -> None:
     from lib.generation_queue import get_generation_queue
 
-    await get_generation_queue().persist_provider_job_id(task_id, job_id, endpoint=endpoint)
+    await get_generation_queue().persist_provider_job_id(task_id, job_id, endpoint=endpoint, base_url=base_url)
 
 
-async def persist_provider_job_id(task_id: str, job_id: str, *, provider: str, endpoint: str | None = None) -> None:
+async def persist_provider_job_id(
+    task_id: str,
+    job_id: str,
+    *,
+    provider: str,
+    endpoint: str | None = None,
+    base_url: str | None = None,
+) -> None:
     """Submit 之后立即调：把 job_id 持久化到 DB 让重启可接续。
 
-    Caller 显式传 task_id；``endpoint`` 仅自定义供应商有值（内置供应商无 endpoint 维度），
-    与 job_id 同一次写入落地，供续跑判定协议是否已被换掉。DB 瞬态错误最多重试 3 次，业务
-    异常立即抛。重试用尽抛异常，由 worker finally 兜底 mark_failed（fail-fast）。
+    Caller 显式传 task_id；``endpoint`` 记提交该 job 实际使用的执行端点，与 job_id 同一次写入
+    落地供续跑消费，按供应商类型有两种取值：自定义供应商记 endpoint 标识（协议维度，续跑据
+    此判定协议是否已被换掉），内置供应商记实际请求域名（连接维度，续跑据此回放原域名轮询）。
+    ``base_url`` 是自定义供应商那半边的请求域名，其 ``endpoint`` 位已被协议标识占用，域名另落
+    一列，同样供续跑回放。DB 瞬态错误最多重试 3 次，业务异常立即抛。重试用尽抛异常，由 worker
+    finally 兜底 mark_failed（fail-fast）。
     """
     try:
-        await _persist_with_retry(task_id, job_id, endpoint)
+        await _persist_with_retry(task_id, job_id, endpoint, base_url)
         logger.info("provider_job_id 已持久化 task_id=%s provider=%s job_id=%s", task_id, provider, job_id)
     except Exception as exc:
         logger.error(
@@ -80,16 +91,34 @@ class ProviderJobIdPersistenceMixin:
     （``gemini``）不同，自动取 name 会改写持久化日志的 provider 字段。
     """
 
-    async def _persist_provider_job_id(self, request: VideoGenerationRequest, job_id: str, *, provider: str) -> None:
+    async def _persist_provider_job_id(
+        self,
+        request: VideoGenerationRequest,
+        job_id: str,
+        *,
+        provider: str,
+        endpoint: str | None = None,
+    ) -> None:
         """submit 成功后立即调：worker 路径写回 job_id，非 worker 路径（task_id=None）跳过。
 
-        同时写回 ``request.execution_endpoint``——自定义供应商的包装层在转发前注入本次执行所用
-        的 endpoint，内置供应商恒 None。持久化失败抛出（DB 瞬态错误已在 ``persist_provider_job_id``
-        内重试 3 次），由 worker finally 兜底 mark_failed —— 保持现有 fail-fast 语义（ADR 0007）。
+        同时写回该 job 执行所用的端点，两个维度各占一列：``request.execution_endpoint`` 由自定义
+        供应商的包装层在转发前注入，是续跑比对协议的依据；``endpoint`` 由提交域名随用户配置变化的
+        backend（只有 dashscope 协议这一条线）传入实际请求域名，供续跑回放。自定义供应商两者兼有——
+        协议标识占 endpoint 位、域名走 base_url 位，互不覆盖；内置供应商只有域名，仍落 endpoint 位。
+        持久化失败抛出（DB 瞬态错误已在 ``persist_provider_job_id`` 内重试 3 次），由 worker finally
+        兜底 mark_failed —— 保持现有 fail-fast 语义（ADR 0007）。
         """
-        if request.task_id is None:
-            return
-        await persist_provider_job_id(request.task_id, job_id, provider=provider, endpoint=request.execution_endpoint)
+        if request.task_id is not None:
+            execution_endpoint = request.execution_endpoint
+            await persist_provider_job_id(
+                request.task_id,
+                job_id,
+                provider=provider,
+                endpoint=execution_endpoint or endpoint,
+                base_url=endpoint if execution_endpoint else None,
+            )
+        if request.on_provider_resubmit_unsafe is not None:
+            request.on_provider_resubmit_unsafe()
 
 
 @with_retry_async(
@@ -371,7 +400,7 @@ async def download_video(url: str, output_path: Path, *, timeout: int = 120) -> 
                 await resp.aread()
             resp.raise_for_status()
             # 异步流式读取所有 chunk，然后一次 to_thread 完成整段写入，
-            # 避免对每个 64KB 分片调度一次线程池任务（评审反馈 #279）。
+            # 避免对每个 64KB 分片调度一次线程池任务。
             chunks: list[bytes] = []
             async for chunk in resp.aiter_bytes(chunk_size=65536):
                 chunks.append(chunk)
@@ -396,6 +425,30 @@ class VideoCapabilityError(RuntimeError):
         self.code = code
         self.params = params
         super().__init__(code)
+
+
+def reference_audio_to_data_uri(path: Path, *, model: str, mime_types: Mapping[str, str]) -> str:
+    """参考音频 → base64 data URI；格式不受支持或文件不可读一律抛错。
+
+    音频不能像参考图那样「缺失即跳过」：prompt 里的「音频N」按 content 数组中音频条目的
+    出现顺序编号，跳过一段会让其后所有编号整体前移，把某个角色的音色安到另一个角色头上
+    ——错得无声无息，且照常扣费。
+
+    ``mime_types`` 由各 backend 传入：同一个扩展名各家接受的 MIME 写法不一致（mp3 有
+    ``audio/mp3`` 与 ``audio/mpeg`` 两种口径），合表会让其中一家收到没验证过的 MIME。
+    """
+    mime = mime_types.get(path.suffix.lower())
+    if mime is None:
+        raise VideoCapabilityError(
+            "video_reference_audio_format_unsupported",
+            model=model,
+            name=path.name,
+            supported=", ".join(sorted(mime_types)),
+        )
+    try:
+        return file_to_data_uri(path, mime)
+    except OSError as exc:
+        raise VideoCapabilityError("video_reference_audio_unreadable", model=model, names=path.name) from exc
 
 
 class ReferenceAudioMode(StrEnum):
@@ -445,6 +498,21 @@ class VideoCapabilities:
     为字符数（中英文同权），与各家文档一致。超限的典型失败模式是静默截断而非报错：供应商照常
     扣费、成片与意图不符、用户无从知情，正是 :func:`lib.video_frame_slots.gate_video_request`
     要在付费前堵住的降级。
+
+    ``first_frame_ratio_adaptive_only``：该模型的首帧（image-to-video）任务是否只接受
+    "adaptive" 比例。声明为 True 时，:func:`lib.video_frame_slots.resolve_first_frame_aspect_ratio`
+    把带首帧的生成请求的 ``VideoGenerationRequest.aspect_ratio`` 改写为字面量 ``"adaptive"``；
+    不带首帧的请求（纯文生 / 仅参考图）与续接已发起 job 的 resume 路径不受影响。该字面量是供应商
+    侧的取值，只对认得它的 backend 有意义，故本位只由这类 backend 声明——别处（如
+    :func:`lib.aspect_size.parse_aspect_ratio`）解析不了它，会按非法值回退默认比例。
+
+    「首帧在场时用户比例不适用」这一情形另有 backend 各自的表达方式：dashscope 与 vidu 在
+    payload 组装期直接不下发 ratio（上游忽略或拒收）。三者形状相近而取值策略不同（省略 vs 改写
+    为 adaptive），未收敛到同一开关；本位表达的是"改写为 adaptive"这一支。
+
+    用户的比例意图仍完整作用于分镜图生成——首帧图本就按该比例生成，"跟随首帧"与用户所选比例
+    等价；改写只影响视频请求实际下发的值，不改调用方持有的原始 ``aspect_ratio``（记账、版本
+    元数据沿用后者）。
     """
 
     first_frame: bool = True
@@ -455,6 +523,7 @@ class VideoCapabilities:
     max_reference_audio_total_seconds: float | None = None
     reference_audio_per_image: bool = False
     max_prompt_chars: int | None = None
+    first_frame_ratio_adaptive_only: bool = False
 
 
 @dataclass
@@ -489,9 +558,19 @@ class VideoGenerationRequest:
     # 非 worker 路径（grid / 直生 / 测试）保持 None，统一点据此跳过持久化。
     task_id: str | None = None
 
+    # MediaGenerator uses this one-way signal to close its compression-retry window. Resumable backends signal
+    # after the provider job handle is durable; an opaque submit-and-wait backend must signal before entering a
+    # call whose failure cannot prove that the provider rejected the request before accepting a paid job.
+    on_provider_resubmit_unsafe: Callable[[], None] | None = None
+
     # 自定义供应商包装层（`CustomVideoBackend`）在转发给协议 backend 前注入的 endpoint，
     # 与 job_id 一并持久化供续跑比对。内置供应商无 endpoint 维度，保持 None。
     execution_endpoint: str | None = None
+
+    # 续跑路径专用：提交本 job 时实际使用的请求域名，由 resume_executor 从持久化列回放。
+    # backend 轮询时优先用它而非当下配置解析出的域名——域名是连接维度而非协议维度，
+    # 用户在途改配置后按新域名轮旧 job 会查无（404）而被误判成过期。提交路径恒 None。
+    submitted_base_url: str | None = None
 
     # Seedance 特有
     service_tier: str = "default"

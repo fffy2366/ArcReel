@@ -16,6 +16,7 @@ import type {
   TaskItem,
   TaskStats,
   SessionMeta,
+  ImagePayload,
   EntriesResponse,
   TimelineEntry,
   FailureObservation,
@@ -51,8 +52,11 @@ import type {
   ReferenceResource,
   TransitionType,
   AdShot,
-  AdReferenceUnit,
   ReferenceDurationPrecheck,
+  ReferenceProjectionAdmission,
+  NarratedVideoDurationAdmission,
+  ReferenceGenerationRequestOptions,
+  ReferenceRequestOptions,
   ScriptPreview,
   ScriptReviewState,
   DramaNormalizedScript,
@@ -61,7 +65,7 @@ import type {
   VideoCapabilities,
 } from "@/types";
 import type { GenerationRoute } from "@/utils/generation-mode";
-import type { GridGeneration } from "@/types/grid";
+import type { GridCapability, GridGeneration } from "@/types/grid";
 import type { Asset, AssetType, AssetCreatePayload, AssetUpdatePayload } from "@/types/asset";
 import type {
   AgentCredential,
@@ -77,6 +81,40 @@ import i18n from "./i18n";
 
 // ==================== Helper types ====================
 
+/** 项目内四类资产（与后端 ASSET_SPECS 的 asset_type 对齐）。 */
+export type ProjectAssetType = "character" | "scene" | "prop" | "product";
+
+/** asset_type → REST 路径段（与后端 spec.subdir 对齐）。 */
+const ASSET_TYPE_PATH: Record<ProjectAssetType, string> = {
+  character: "characters",
+  scene: "scenes",
+  prop: "props",
+  product: "products",
+};
+
+function referenceRequestQuery(
+  options: ReferenceRequestOptions,
+  initial?: Record<string, string>,
+): string {
+  const query = new URLSearchParams(initial);
+  if (options.narration_delivery) {
+    query.set("narration_delivery", options.narration_delivery);
+  }
+  const serialized = query.toString();
+  return serialized ? `?${serialized}` : "";
+}
+
+/** 资产级联重命名的影响报告（dry_run 预览与执行同一结构）。 */
+export interface AssetRenameResult {
+  success: boolean;
+  dry_run: boolean;
+  old_name: string;
+  new_name: string;
+  episodes: number;
+  references: number;
+  files: number;
+}
+
 /** Login response from POST /auth/token (mirrors backend TokenResponse). */
 export interface LoginResponse {
   access_token: string;
@@ -85,7 +123,112 @@ export interface LoginResponse {
 
 /** Standard error response body from backend (mirrors FastAPI HTTPException detail). */
 export interface ErrorResponse {
-  detail: string | { msg?: string }[] | AgentFailureDetail;
+  detail:
+    | string
+    | { msg?: string }[]
+    | AgentFailureDetail
+    | SpeechAdmission
+    | ScriptEditResult
+    | ReferenceProjectionAdmission
+    | NarratedVideoDurationAdmission;
+}
+
+export interface SpeechAdmissionLocation {
+  path: (string | number)[];
+  line: number | null;
+}
+
+export interface SpeechAdmissionProblem {
+  code: "mixed_speech" | "needs_replan" | "parse_failed" | "empty_speaker";
+  unit_id: string;
+  locations: SpeechAdmissionLocation[];
+  reason: string;
+  action: string;
+}
+
+export interface SpeechAdmission {
+  allowed: false;
+  unit_id: string;
+  mode: null;
+  problems: SpeechAdmissionProblem[];
+}
+
+export type ScriptEditOperation =
+  | { op: "update"; id: string; fields: Record<string, unknown> }
+  | { op: "insert_after"; after_id: string | null; item: Record<string, unknown> }
+  | { op: "move_after"; id: string; after_id: string | null }
+  | { op: "remove"; id: string };
+
+export interface ScriptEditCommand {
+  script?: string;
+  episode?: number;
+  expected_revision: string;
+  operations: ScriptEditOperation[];
+}
+
+export interface ScriptEditProblem {
+  code: string;
+  operation_index: number | null;
+  unit_id: string | null;
+  locations: SpeechAdmissionLocation[];
+  reason: string;
+  next_action: string;
+}
+
+export interface ScriptEditResult {
+  success: boolean;
+  script: string;
+  episode: number | null;
+  before_revision: string;
+  revision: string;
+  affected_ids: string[];
+  problems: ScriptEditProblem[];
+}
+
+export class ScriptEditCommandError extends Error {
+  readonly code = "script_edit_rejected" as const;
+
+  constructor(public readonly result: ScriptEditResult) {
+    super(formatScriptEditResult(result));
+    this.name = "ScriptEditCommandError";
+  }
+}
+
+export interface EpisodeScriptSnapshot {
+  script: EpisodeScript;
+  revision: string;
+}
+
+/** Preserves the structured speech blocker for UI actions and diagnostics. */
+export class SpeechAdmissionError extends Error {
+  readonly code = "speech_admission_blocked" as const;
+
+  constructor(public readonly admission: SpeechAdmission) {
+    super(formatSpeechAdmission(admission));
+    this.name = "SpeechAdmissionError";
+  }
+}
+
+/** Preserves reference request blockers so the UI can show a repair action. */
+export class ReferenceProjectionError extends Error {
+  readonly code = "reference_request_projection_blocked" as const;
+
+  constructor(public readonly projection: ReferenceProjectionAdmission) {
+    const firstBlocking = projection.problems.find(({ blocking }) => blocking);
+    super(firstBlocking?.message || firstBlocking?.code || "reference_request_projection_blocked");
+    this.name = "ReferenceProjectionError";
+  }
+}
+
+/** Preserves current TTS/duration blockers so callers can perform an exact-tier retry. */
+export class NarratedVideoDurationError extends Error {
+  readonly code = "narrated_video_duration_blocked" as const;
+
+  constructor(public readonly admission: NarratedVideoDurationAdmission) {
+    const firstBlocking = admission.problems.find(({ blocking }) => blocking);
+    super(firstBlocking?.message || firstBlocking?.code || "narrated_video_duration_blocked");
+    this.name = "NarratedVideoDurationError";
+  }
 }
 
 /** Structured detail returned when the local Agent process cannot start. */
@@ -197,6 +340,11 @@ export interface SuccessResponse {
   message?: string;
 }
 
+export interface AgentProfileStatus {
+  customized: boolean;
+  customized_files: string[];
+}
+
 /** 说书模式片段 PATCH 入参（drama 模式片段走 {@link API.updateScene}）。 */
 export interface SegmentUpdatePayload {
   script_file: string;
@@ -223,6 +371,8 @@ export interface CreateProjectPayload {
   generation_mode: GenerationRoute;
   /** 分镜板（宫格）装配开关，可随创建写入；仅分镜路线有意义。 */
   grid_storyboard?: boolean;
+  /** 口播语速估算（阅读单位 / 秒）；留空即按项目语言的默认速度估算。 */
+  speech_rate_units_per_second?: number | null;
   default_duration?: number | null;
   /** 仅 ad：目标总时长（秒），UI 四档 15/30/60/90。 */
   target_duration?: number;
@@ -291,6 +441,15 @@ async function throwIfNotOk(response: Response, fallbackMsg: string): Promise<vo
       .json()
       .catch(() => ({ detail: response.statusText })) as ErrorResponse;
     const detail = error.detail;
+    if (isReferenceProjectionAdmission(detail)) {
+      throw new ReferenceProjectionError(detail);
+    }
+    if (isNarratedVideoDurationAdmission(detail)) {
+      throw new NarratedVideoDurationError(detail);
+    }
+    if (isSpeechAdmission(detail)) {
+      throw new SpeechAdmissionError(detail);
+    }
     throw new Error(typeof detail === "string" ? detail || fallbackMsg : fallbackMsg);
   }
 }
@@ -318,6 +477,174 @@ function isAgentFailureDetail(value: unknown): value is AgentFailureDetail {
     && typeof detail.failure === "object"
     && !Array.isArray(detail.failure)
   );
+}
+
+function isSpeechAdmission(value: unknown): value is SpeechAdmission {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const detail = value as Record<string, unknown>;
+  return (
+    detail.allowed === false
+    && typeof detail.unit_id === "string"
+    && detail.mode === null
+    && Array.isArray(detail.problems)
+    && detail.problems.length > 0
+    && detail.problems.every((problem) => {
+      if (!problem || typeof problem !== "object" || Array.isArray(problem)) return false;
+      const entry = problem as Record<string, unknown>;
+      return (
+        ["mixed_speech", "needs_replan", "parse_failed", "empty_speaker"].includes(String(entry.code))
+        && typeof entry.unit_id === "string"
+        && Array.isArray(entry.locations)
+        && entry.locations.every((location) => {
+          if (!location || typeof location !== "object" || Array.isArray(location)) return false;
+          const field = location as Record<string, unknown>;
+          return (
+            Array.isArray(field.path)
+            && field.path.every((part) => typeof part === "string" || typeof part === "number")
+            && (field.line === null || typeof field.line === "number")
+          );
+        })
+        && typeof entry.reason === "string"
+        && typeof entry.action === "string"
+      );
+    })
+  );
+}
+
+function isScriptEditResult(value: unknown): value is ScriptEditResult {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const result = value as Record<string, unknown>;
+  return (
+    result.success === false
+    && typeof result.script === "string"
+    && typeof result.revision === "string"
+    && Array.isArray(result.problems)
+    && result.problems.length > 0
+  );
+}
+
+function isReferenceProjectionAdmission(value: unknown): value is ReferenceProjectionAdmission {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const detail = value as Record<string, unknown>;
+  return (
+    detail.allowed === false
+    && detail.kind === "reference_request_projection"
+    && typeof detail.unit_id === "string"
+    && Array.isArray(detail.problems)
+    && detail.problems.length > 0
+    && detail.problems.every((problem) => {
+      if (!problem || typeof problem !== "object" || Array.isArray(problem)) return false;
+      const entry = problem as Record<string, unknown>;
+      return (
+        typeof entry.code === "string"
+        && typeof entry.blocking === "boolean"
+        && typeof entry.unit_id === "string"
+        && Array.isArray(entry.locations)
+        && entry.locations.every((location) => {
+          if (!location || typeof location !== "object" || Array.isArray(location)) return false;
+          const field = location as Record<string, unknown>;
+          return (
+            Array.isArray(field.path)
+            && field.path.every((part) => typeof part === "string" || typeof part === "number")
+            && (field.line === null || typeof field.line === "number")
+          );
+        })
+        && Boolean(entry.params)
+        && typeof entry.params === "object"
+        && !Array.isArray(entry.params)
+        && typeof entry.action === "string"
+        && (entry.message === undefined || typeof entry.message === "string")
+      );
+    })
+  );
+}
+
+function isNarratedVideoDurationAdmission(value: unknown): value is NarratedVideoDurationAdmission {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const detail = value as Record<string, unknown>;
+  return (
+    detail.allowed === false
+    && detail.kind === "narrated_video_duration"
+    && typeof detail.unit_id === "string"
+    && typeof detail.narration_delivery === "object"
+    && detail.narration_delivery !== null
+    && !Array.isArray(detail.narration_delivery)
+    && typeof detail.planned_duration === "number"
+    && typeof detail.duration_input === "number"
+    && (detail.request_duration === null || typeof detail.request_duration === "number")
+    && (
+      detail.adjustment === null
+      || detail.adjustment === "exact"
+      || detail.adjustment === "up"
+      || detail.adjustment === "down"
+    )
+    && Array.isArray(detail.problems)
+    && detail.problems.length > 0
+    && detail.problems.every((problem) => {
+      if (!problem || typeof problem !== "object" || Array.isArray(problem)) return false;
+      const entry = problem as Record<string, unknown>;
+      return (
+        typeof entry.code === "string"
+        && typeof entry.blocking === "boolean"
+        && typeof entry.unit_id === "string"
+        && Array.isArray(entry.locations)
+        && Boolean(entry.params)
+        && typeof entry.params === "object"
+        && !Array.isArray(entry.params)
+        && typeof entry.action === "string"
+        && (entry.message === undefined || typeof entry.message === "string")
+      );
+    })
+  );
+}
+
+function formatSpeechAdmission(admission: SpeechAdmission): string {
+  const problem = admission.problems.find(({ code }) => code !== "needs_replan") ?? admission.problems[0];
+  const location = problem.locations
+    .map(({ path, line }) => `${path.join(".")}${line === null ? "" : `:${line + 1}`}`)
+    .join(", ");
+  const key = {
+    mixed_speech: "speech_admission_mixed_speech",
+    needs_replan: "speech_admission_needs_replan",
+    parse_failed: "speech_admission_parse_failed",
+    empty_speaker: "speech_admission_empty_speaker",
+  }[problem.code];
+  return i18n.t(`dashboard:${key}`, { unitId: problem.unit_id, location });
+}
+
+function formatScriptEditResult(result: ScriptEditResult): string {
+  const first = result.problems[0];
+  if (!first) return i18n.t("dashboard:script_edit_rejected");
+  const speechCodes: SpeechAdmissionProblem["code"][] = [
+    "mixed_speech",
+    "needs_replan",
+    "parse_failed",
+    "empty_speaker",
+  ];
+  if (speechCodes.includes(first.code as SpeechAdmissionProblem["code"]) && first.unit_id !== null) {
+    const unitId = first.unit_id;
+    const problems = result.problems
+      .filter(({ code, unit_id }) => (
+        unit_id === unitId && speechCodes.includes(code as SpeechAdmissionProblem["code"])
+      ))
+      .map((problem) => ({
+        code: problem.code as SpeechAdmissionProblem["code"],
+        unit_id: problem.unit_id ?? unitId,
+        locations: problem.locations,
+        reason: problem.reason,
+        action: problem.next_action,
+      }));
+    return formatSpeechAdmission({ allowed: false, unit_id: unitId, mode: null, problems });
+  }
+  const key = {
+    revision_conflict: "script_edit_revision_conflict",
+    operation_invalid: "script_edit_operation_invalid",
+    schema_invalid: "script_edit_schema_invalid",
+    references_invalid: "script_edit_references_invalid",
+    manifest_invalid: "script_edit_manifest_invalid",
+    commit_failed: "script_edit_commit_failed",
+  }[first.code] ?? "script_edit_rejected";
+  return i18n.t(`dashboard:${key}`);
 }
 
 /** 为 fetch options 注入 Authorization header */
@@ -415,11 +742,27 @@ class API {
 
     if (!response.ok) {
       handleUnauthorized(response);
-      const error = await response
+      const payload = await response
         .json()
-        .catch(() => ({ detail: response.statusText })) as ErrorResponse;
+        .catch(() => ({ detail: response.statusText })) as unknown;
+      if (isScriptEditResult(payload)) {
+        throw new ScriptEditCommandError(payload);
+      }
+      const error = payload as ErrorResponse;
+      if (isScriptEditResult(error.detail)) {
+        throw new ScriptEditCommandError(error.detail);
+      }
       if (isAgentFailureDetail(error.detail)) {
         throw new AgentFailureError(error.detail.message, error.detail.failure);
+      }
+      if (isReferenceProjectionAdmission(error.detail)) {
+        throw new ReferenceProjectionError(error.detail);
+      }
+      if (isNarratedVideoDurationAdmission(error.detail)) {
+        throw new NarratedVideoDurationError(error.detail);
+      }
+      if (isSpeechAdmission(error.detail)) {
+        throw new SpeechAdmissionError(error.detail);
       }
       let message = "请求失败";
       if (typeof error.detail === "string") {
@@ -527,6 +870,16 @@ class API {
     return this.request(`/projects/${encodeURIComponent(name)}`, {
       method: "PATCH",
       body: JSON.stringify(updates),
+    });
+  }
+
+  static async getAgentProfileStatus(name: string): Promise<AgentProfileStatus> {
+    return this.request(`/projects/${encodeURIComponent(name)}/agent-profile`);
+  }
+
+  static async resetAgentProfile(name: string): Promise<AgentProfileStatus> {
+    return this.request(`/projects/${encodeURIComponent(name)}/agent-profile/reset`, {
+      method: "POST",
     });
   }
 
@@ -825,15 +1178,49 @@ class API {
     );
   }
 
+  // ==================== 项目资产重命名 ====================
+
+  /**
+   * 级联重命名项目内资产。`dryRun: true` 只返回影响预览（将更新的集数/引用处数/文件数），
+   * 预览与执行共用后端同一套扫描逻辑，确认框数字与实际执行一致。
+   */
+  static async renameProjectAsset(
+    projectName: string,
+    assetType: ProjectAssetType,
+    name: string,
+    newName: string,
+    options: { dryRun?: boolean; signal?: AbortSignal } = {}
+  ): Promise<AssetRenameResult> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/${ASSET_TYPE_PATH[assetType]}/${encodeURIComponent(name)}/rename`,
+      {
+        method: "POST",
+        body: JSON.stringify({ new_name: newName, dry_run: options.dryRun ?? false }),
+        signal: options.signal,
+      }
+    );
+  }
+
   // ==================== 场景管理 ====================
 
   static async getScript(
     projectName: string,
     scriptFile: string
-  ): Promise<EpisodeScript> {
+  ): Promise<EpisodeScriptSnapshot> {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/scripts/${encodeURIComponent(scriptFile)}`
     );
+  }
+
+  /** Revisioned, ordered, all-or-nothing episode-script edit command. */
+  static async editScriptBatch(
+    projectName: string,
+    command: ScriptEditCommand
+  ): Promise<ScriptEditResult> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/script-edits`, {
+      method: "POST",
+      body: JSON.stringify(command),
+    });
   }
 
   static async updateScene(
@@ -1346,7 +1733,8 @@ class API {
     segmentId: string,
     prompt: string | Record<string, unknown>,
     scriptFile: string,
-    durationSeconds: number = 4
+    durationSeconds: number = 4,
+    requestOptions: ReferenceGenerationRequestOptions = {},
   ): Promise<{ success: boolean; task_id: string; deduped: boolean; message: string }> {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/generate/video/${encodeURIComponent(segmentId)}`,
@@ -1356,6 +1744,7 @@ class API {
           prompt,
           script_file: scriptFile,
           duration_seconds: durationSeconds,
+          ...requestOptions,
         }),
       }
     );
@@ -1845,7 +2234,7 @@ class API {
     projectName: string,
     content: string,
     sessionId?: string | null,
-    images?: Array<{ data: string; media_type: string }>,
+    images?: ImagePayload[],
     clientKey?: string
   ): Promise<{ session_id: string; status: string; entry: TimelineEntry | null }> {
     return this.request(`${this.assistantBase(projectName)}/sessions/send`, {
@@ -1857,6 +2246,37 @@ class API {
         client_key: clientKey || undefined,
       }),
     });
+  }
+
+  /**
+   * 改写会话中某条历史用户消息：服务端分叉出新会话并在其上重跑。
+   *
+   * `sessionId` 是被改写的原会话，响应里的 `session_id` 是承接改写的新会话。
+   * 运行中的会话由端点自动中断，调用方不必先停止。
+   *
+   * `images` 是锚点消息的图片附件，随改写后的文本一同进入分支会话的首条输入，
+   * 形态与发送端点一致。
+   */
+  static async rewriteAssistantMessage(
+    projectName: string,
+    sessionId: string,
+    anchorEntryUuid: string,
+    content: string,
+    images?: ImagePayload[],
+    clientKey?: string
+  ): Promise<{ status: string; session_id: string; origin_session_id: string | null; entry: TimelineEntry | null }> {
+    return this.request(
+      `${this.assistantBase(projectName)}/sessions/${encodeURIComponent(sessionId)}/rewrite`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          anchor_entry_uuid: anchorEntryUuid,
+          content,
+          images: images || [],
+          client_key: clientKey || undefined,
+        }),
+      }
+    );
   }
 
   static async interruptAssistantSession(
@@ -2210,8 +2630,17 @@ class API {
    * 获取项目费用估算。
    * @param projectName - 项目名称
    */
-  static async getCostEstimate(projectName: string): Promise<CostEstimateResponse> {
-    return this.request(`/projects/${encodeURIComponent(projectName)}/cost-estimate`);
+  static async getCostEstimate(
+    projectName: string,
+    options: ReferenceRequestOptions & { referenceUnitId?: string; signal?: AbortSignal } = {}
+  ): Promise<CostEstimateResponse> {
+    const suffix = referenceRequestQuery(
+      options,
+      options.referenceUnitId ? { reference_unit_id: options.referenceUnitId } : undefined,
+    );
+    return this.request(`/projects/${encodeURIComponent(projectName)}/cost-estimate${suffix}`, {
+      signal: options.signal,
+    });
   }
 
   // ==================== Grid 图生视频 API ====================
@@ -2249,6 +2678,19 @@ class API {
   }
 
   /**
+   * 获取项目的宫格档位能力（4×4/5×5 是否可用、单张格数上限）
+   * @param projectName - 项目名称
+   */
+  static async getGridCapability(
+    projectName: string,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<GridCapability> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/grid-capability`, {
+      signal: options.signal,
+    });
+  }
+
+  /**
    * 获取单个 Grid 详情
    * @param projectName - 项目名称
    * @param gridId - Grid ID
@@ -2270,6 +2712,42 @@ class API {
       `/projects/${encodeURIComponent(projectName)}/grids/${encodeURIComponent(gridId)}/regenerate`,
       { method: "POST" }
     );
+  }
+
+  /**
+   * 切分落格：按当前联合图覆写各分镜格（唯一覆写分镜格的操作，同步执行）
+   * @param projectName - 项目名称
+   * @param gridId - Grid ID
+   */
+  static async splitGrid(
+    projectName: string,
+    gridId: string
+  ): Promise<{
+    success: boolean;
+    split_at: string | null;
+    updated_scene_ids: string[];
+    missing_scene_ids: string[];
+    asset_fingerprints: Record<string, number>;
+  }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/grids/${encodeURIComponent(gridId)}/split`,
+      { method: "POST" }
+    );
+  }
+
+  /**
+   * 上传联合图替换当前宫格图（仅转 PNG 归一化，不缩放、不校验布局；不触发切分）
+   * @param projectName - 项目名称
+   * @param gridId - Grid ID
+   * @param file - 图片文件
+   */
+  static async uploadGridImage(
+    projectName: string,
+    gridId: string,
+    file: File
+  ): Promise<{ success: boolean; path: string; version: number; asset_fingerprints: Record<string, number> }> {
+    const url = `/projects/${encodeURIComponent(projectName)}/grids/${encodeURIComponent(gridId)}/upload`;
+    return API.postFileUpload(url, file);
   }
 
   // ==================== Global Asset Library ====================
@@ -2449,18 +2927,19 @@ class API {
   }
 
   /**
-   * 入队前的时长取档预检：申请秒数与剧本编排不一致时需先向用户确认。
+   * 入队前的时长取档预检：申请秒数与请求时长基准不一致时需先向用户确认。
    *
-   * 取档按项目当前配置近似解析，实际档位以执行时的模型能力为准。
+   * 预检按请求时的项目、剧本与资产状态解析；worker 启动时重新投影当前状态。
    */
   static async precheckReferenceVideoDuration(
     projectName: string,
     episode: number,
     unitId: string,
-    options?: { signal?: AbortSignal },
+    options?: ReferenceRequestOptions & { signal?: AbortSignal },
   ): Promise<ReferenceDurationPrecheck> {
+    const suffix = referenceRequestQuery(options ?? {});
     return this.request(
-      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/${encodeURIComponent(unitId)}/duration-precheck`,
+      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/${encodeURIComponent(unitId)}/duration-precheck${suffix}`,
       { signal: options?.signal },
     );
   }
@@ -2488,37 +2967,14 @@ class API {
     projectName: string,
     episode: number,
     unitId: string,
+    options: ReferenceGenerationRequestOptions = {},
   ): Promise<{ task_id: string; deduped: boolean }> {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/${encodeURIComponent(unitId)}/generate`,
-      { method: "POST" },
+      { method: "POST", body: JSON.stringify(options) },
     );
   }
 
-  // ==================== Ad Reference-to-Video（派生分组） ====================
-
-  /** ad 项目：列出已持久化的派生分组索引（未派生时为空数组）。 */
-  static async listAdReferenceUnits(
-    projectName: string,
-    episode: number,
-    options?: { signal?: AbortSignal },
-  ): Promise<{ units: AdReferenceUnit[] }> {
-    return this.request(
-      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units`,
-      { signal: options?.signal },
-    );
-  }
-
-  /** ad 项目：从 shots（重新）派生分组索引并持久化；分组可复现，仅 ad 开放。 */
-  static async deriveAdReferenceUnits(
-    projectName: string,
-    episode: number,
-  ): Promise<{ units: AdReferenceUnit[] }> {
-    return this.request(
-      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/derive-units`,
-      { method: "POST" },
-    );
-  }
 }
 
 export { API };

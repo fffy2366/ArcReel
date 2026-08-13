@@ -1,5 +1,12 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { AgentFailureError, API, ConflictError } from "@/api";
+import {
+  AgentFailureError,
+  API,
+  ConflictError,
+  ReferenceProjectionError,
+  ScriptEditCommandError,
+  SpeechAdmissionError,
+} from "@/api";
 
 type JsonResponseOptions = {
   ok?: boolean;
@@ -129,6 +136,148 @@ describe("API", () => {
       }
     });
 
+    it("preserves and presents a structured speech admission blocker", async () => {
+      const admission = {
+        allowed: false as const,
+        unit_id: "E1S01",
+        mode: null,
+        problems: [{
+          code: "needs_replan" as const,
+          unit_id: "E1S01",
+          locations: [{ path: ["needs_replan"], line: null }],
+          reason: "unit_marked_needs_replan",
+          action: "replan_unit",
+        }, {
+          code: "mixed_speech" as const,
+          unit_id: "E1S01",
+          locations: [
+            { path: ["utterances", 0, "text"], line: null },
+            { path: ["utterances", 1, "text"], line: null },
+          ],
+          reason: "character_and_narrator_mixed",
+          action: "replan_unit",
+        }],
+      };
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+        mockResponse({ ok: false, status: 409, jsonData: { detail: admission } }),
+      ));
+
+      try {
+        await API.generateVideo("demo", "E1S01", "vid", "episode_1.json");
+        expect.fail("request should fail");
+      } catch (error) {
+        expect(error).toBeInstanceOf(SpeechAdmissionError);
+        expect((error as SpeechAdmissionError).admission).toEqual(admission);
+        expect((error as Error).message).toContain("E1S01");
+        expect((error as Error).message).toContain("utterances.0.text");
+      }
+    });
+
+    it("preserves a narrated-video duration blocker for an exact-tier retry", async () => {
+      const admission = {
+        allowed: false as const,
+        kind: "narrated_video_duration" as const,
+        unit_id: "E1S01",
+        narration_delivery: {},
+        planned_duration: 8,
+        duration_input: 10.4,
+        request_duration: 12,
+        adjustment: "up" as const,
+        problems: [{
+          code: "reference_duration_confirmation_required",
+          blocking: true,
+          unit_id: "E1S01",
+          locations: [{ path: ["duration_seconds"], line: null }],
+          params: { duration_input: 10.4, request_duration: 12 },
+          reason: "request_duration_uses_different_tier",
+          action: "confirm_duration",
+          message: "Confirm the 12s tier",
+        }],
+      };
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+        mockResponse({ ok: false, status: 400, jsonData: { detail: admission } }),
+      ));
+
+      await expect(
+        API.generateVideo("demo", "E1S01", "vid", "episode_1.json", 8, {
+          narration_delivery: "use_tts",
+        }),
+      ).rejects.toMatchObject({
+        name: "NarratedVideoDurationError",
+        admission,
+        message: "Confirm the 12s tier",
+      });
+    });
+
+    it("preserves the shared script-edit result from compatibility endpoints", async () => {
+      const result = {
+        success: false,
+        script: "episode_1.json",
+        episode: 1,
+        before_revision: `sha256-v1:${"0".repeat(64)}`,
+        revision: `sha256-v1:${"0".repeat(64)}`,
+        affected_ids: [],
+        problems: [{
+          code: "mixed_speech",
+          operation_index: 2,
+          unit_id: "E1S01",
+          locations: [{ path: ["utterances", 0, "text"], line: null }],
+          reason: "character_and_narrator_mixed",
+          next_action: "replan_unit",
+        }],
+      };
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+        mockResponse({ ok: false, status: 409, jsonData: { detail: result } }),
+      ));
+
+      try {
+        await API.updateScene("demo", "E1S01", "episode_1.json", { note: "keep" });
+        expect.fail("request should fail");
+      } catch (error) {
+        expect(error).toBeInstanceOf(ScriptEditCommandError);
+        expect((error as ScriptEditCommandError).result).toEqual(result);
+      }
+    });
+
+    it("preserves a structured reference request projection blocker", async () => {
+      const projection = {
+        allowed: false as const,
+        kind: "reference_request_projection" as const,
+        unit_id: "E1U1",
+        problems: [
+          {
+            code: "reference_images_clamped",
+            blocking: false,
+            unit_id: "E1U1",
+            locations: [{ path: ["references"], line: null }],
+            params: { count: 4, max_count: 3 },
+            action: "review_reference_selection",
+            message: "参考图片将被裁剪",
+          },
+          {
+            code: "reference_asset_missing",
+            blocking: true,
+            unit_id: "E1U1",
+            locations: [{ path: ["references"], line: null }],
+            params: { missing: [["character", "张三"]] },
+            action: "repair_reference_assets",
+            message: "参考资产缺失",
+          },
+        ],
+      };
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+        mockResponse({ ok: false, status: 400, jsonData: { detail: projection } }),
+      ));
+
+      try {
+        await API.precheckReferenceVideoDuration("demo", 1, "E1U1");
+        expect.fail("request should fail");
+      } catch (error) {
+        expect(error).toBeInstanceOf(ReferenceProjectionError);
+        expect(error).toMatchObject({ message: "参考资产缺失", projection });
+      }
+    });
+
     it("clears auth and redirects on unauthorized responses", async () => {
       const fetchMock = vi.fn().mockResolvedValue(
         mockResponse({
@@ -190,8 +339,15 @@ describe("API", () => {
       await API.addProjectProduct("demo", "Phone", "sleek", "Acme");
       await API.updateProjectProduct("demo", "Phone", { description: "matte" });
       await API.deleteProjectProduct("demo", "Phone");
+      await API.renameProjectAsset("demo", "character", "Hero", "Knight");
+      await API.renameProjectAsset("demo", "product", "Phone", "Tablet", { dryRun: true });
 
       await API.getScript("demo", "episode 1.json");
+      await API.editScriptBatch("demo", {
+        script: "episode_1.json",
+        expected_revision: `sha256-v1:${"0".repeat(64)}`,
+        operations: [{ op: "update", id: "E1S01", fields: { note: "keep" } }],
+      });
       await API.updateScene("demo", "scene-1", "episode_1.json", { x: 1 });
       await API.updateSegment("demo", "segment-1", { y: 2 });
       await API.updateShot("demo", "E1S01", "episode_1.json", { voiceover_text: "新口播" });
@@ -263,6 +419,16 @@ describe("API", () => {
       expect(requestSpy).toHaveBeenCalledWith("/projects/demo/products/Phone", {
         method: "DELETE",
       });
+      expect(requestSpy).toHaveBeenCalledWith("/projects/demo/characters/Hero/rename", {
+        method: "POST",
+        body: JSON.stringify({ new_name: "Knight", dry_run: false }),
+        signal: undefined,
+      });
+      expect(requestSpy).toHaveBeenCalledWith("/projects/demo/products/Phone/rename", {
+        method: "POST",
+        body: JSON.stringify({ new_name: "Tablet", dry_run: true }),
+        signal: undefined,
+      });
       expect(requestSpy).toHaveBeenCalledWith("/projects/demo/generate/product/Phone", {
         method: "POST",
         body: JSON.stringify({ prompt: "prompt" }),
@@ -270,6 +436,14 @@ describe("API", () => {
       expect(requestSpy).toHaveBeenCalledWith(
         "/projects/demo/scripts/episode%201.json",
       );
+      expect(requestSpy).toHaveBeenCalledWith("/projects/demo/script-edits", {
+        method: "POST",
+        body: JSON.stringify({
+          script: "episode_1.json",
+          expected_revision: `sha256-v1:${"0".repeat(64)}`,
+          operations: [{ op: "update", id: "E1S01", fields: { note: "keep" } }],
+        }),
+      });
       expect(requestSpy).toHaveBeenCalledWith("/projects/demo/script-scenes/scene-1", {
         method: "PATCH",
         body: JSON.stringify({ script_file: "episode_1.json", updates: { x: 1 } }),
@@ -302,6 +476,21 @@ describe("API", () => {
           prompt: "vid",
           script_file: "episode_1.json",
           duration_seconds: 4,
+        }),
+      });
+
+      await API.generateVideo("demo", "seg-1", "vid", "episode_1.json", 8, {
+        narration_delivery: "use_tts",
+        confirmed_request_duration_seconds: 12,
+      });
+      expect(requestSpy).toHaveBeenCalledWith("/projects/demo/generate/video/seg-1", {
+        method: "POST",
+        body: JSON.stringify({
+          prompt: "vid",
+          script_file: "episode_1.json",
+          duration_seconds: 8,
+          narration_delivery: "use_tts",
+          confirmed_request_duration_seconds: 12,
         }),
       });
       expect(requestSpy).toHaveBeenCalledWith("/projects/demo/generate/tts/seg-1", {
@@ -1042,29 +1231,41 @@ describe("API.referenceVideos", () => {
 
   it("generateReferenceVideoUnit returns task id", async () => {
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ task_id: "t-1", deduped: false }), { status: 202 }));
-    const res = await API.generateReferenceVideoUnit("proj", 1, "E1U1");
+    const res = await API.generateReferenceVideoUnit("proj", 1, "E1U1", {
+      narration_delivery: "use_tts",
+      confirmed_request_duration_seconds: 12,
+    });
     expect(res.task_id).toBe("t-1");
+    const body = JSON.parse(fetchMock.mock.calls[0]![1]!.body as string);
+    expect(body).toEqual({
+      narration_delivery: "use_tts",
+      confirmed_request_duration_seconds: 12,
+    });
   });
 
-  it("listAdReferenceUnits gets the persisted index", async () => {
-    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ units: [] }), { status: 200 }));
-    const res = await API.listAdReferenceUnits("proj", 1);
-    expect(res.units).toEqual([]);
-    const [url] = fetchMock.mock.calls[0]!;
-    expect(String(url)).toContain("/projects/proj/reference-videos/episodes/1/units");
-  });
+  it("precheckReferenceVideoDuration sends narration projection options", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({}), { status: 200 }));
 
-  it("deriveAdReferenceUnits posts to derive-units", async () => {
-    fetchMock.mockResolvedValueOnce(
-      new Response(JSON.stringify({ units: [{ unit_id: "E1U1", shot_ids: ["E1S1"], references: [] }] }), {
-        status: 200,
-      }),
+    await API.precheckReferenceVideoDuration("proj", 1, "E1U1", {
+      narration_delivery: "use_tts",
+    });
+
+    expect(fetchMock.mock.calls[0]![0]).toContain(
+      "duration-precheck?narration_delivery=use_tts",
     );
-    const res = await API.deriveAdReferenceUnits("proj", 1);
-    expect(res.units[0]?.unit_id).toBe("E1U1");
-    const [url, init] = fetchMock.mock.calls[0]!;
-    expect(String(url)).toContain("/projects/proj/reference-videos/episodes/1/derive-units");
-    expect(init!.method).toBe("POST");
+  });
+
+  it("getCostEstimate sends unit-scoped narration projection options", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({}), { status: 200 }));
+
+    await API.getCostEstimate("proj", {
+      referenceUnitId: "E1U1",
+      narration_delivery: "use_tts",
+    });
+
+    expect(fetchMock.mock.calls[0]![0]).toContain(
+      "cost-estimate?reference_unit_id=E1U1&narration_delivery=use_tts",
+    );
   });
 
   it("deleteReferenceVideoUnit returns void on 204", async () => {

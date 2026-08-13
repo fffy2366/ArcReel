@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -50,6 +52,7 @@ from server.agent_runtime.sdk_tools.text_generation import (
     validate_and_promote_reference_draft_tool,
 )
 from tests.fakes import fake_reference_caps_fetcher
+from tests.speech_contract_cases import SPEECH_CONTRACT_CASES, SpeechContractCase
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -75,7 +78,8 @@ class _FakePM:
                 {
                     "segment_id": "E1S01",
                     "image_prompt": "村口黄昏",
-                    "video_prompt": "镜头平移",
+                    "novel_text": "黄昏时分，风吹过村口。",
+                    "video_prompt": {"action": "镜头平移", "camera_motion": "Pan", "ambiance_audio": "风声"},
                     "duration_seconds": 4,
                     "generated_assets": {"storyboard_image": "storyboards/scene_E1S01.png"},
                 },
@@ -123,6 +127,91 @@ def fake_ctx(tmp_path: Path) -> ToolContext:
         projects_root=tmp_path,
         pm=_FakePM("demo", project_dir),  # type: ignore[arg-type]
     )
+
+
+@pytest.fixture(autouse=True)
+def _stub_audio_switch_guard(monkeypatch):
+    """视频入队前的音频开关预检要读真实配置库，本文件不覆盖它的行为，一律放行。
+
+    行为覆盖在 tests/server/agent_runtime/test_enqueue_videos_audio_switch.py。
+    """
+    from server.agent_runtime.sdk_tools import enqueue_videos as _mod
+
+    async def _noop(_project, _capability):
+        return None
+
+    monkeypatch.setattr(_mod, "assert_audio_switch_supported", _noop)
+
+
+def _fake_reference_projection(
+    slot_for=None,
+    calls: list[str] | None = None,
+    *,
+    current_tts_duration_seconds: float | None = None,
+):
+    """Agent 工具测试用的 in-process request projection adapter。"""
+
+    async def _project(*, project, script, unit, options=None, **_kwargs):
+        from lib.reference_video.request_projection import (
+            ProviderProjectionCandidate,
+            ReferenceUnitRequestProjector,
+            ResolvedReferenceAsset,
+            canonicalize_references,
+        )
+
+        references = canonicalize_references(unit.get("references"))
+        capability = "r2v" if references else "i2v"
+        if calls is not None:
+            calls.append(capability)
+        if slot_for is None:
+            requested_seconds = int(unit.get("duration_seconds") or 8)
+        else:
+            requested_seconds = int(slot_for(None, unit).seconds)
+
+        class _Capabilities:
+            async def resolve_candidate(self, project, capability):
+                del project
+                return ProviderProjectionCandidate(
+                    capability=capability,
+                    provider_id="fake",
+                    model_id=f"fake-{capability}",
+                    supported_durations=(requested_seconds,),
+                    max_reference_images=9,
+                    resolution="1080p",
+                    generate_audio=True,
+                    requested_generate_audio=True,
+                    has_audio_track=True,
+                    audio_switch_controllable=True,
+                )
+
+        class _Available:
+            def is_available(self, asset):
+                del asset
+                return True
+
+        resolved_assets = [
+            ResolvedReferenceAsset(path=Path(f"{reference.type}/{reference.name}.png"), reference=reference)
+            for reference in references
+        ]
+        if options is not None and current_tts_duration_seconds is not None:
+            options = replace(options, current_tts_duration_seconds=current_tts_duration_seconds)
+        return await ReferenceUnitRequestProjector(_Capabilities(), _Available()).project_current(
+            project=project,
+            script=script,
+            unit=unit,
+            resolved_assets=resolved_assets,
+            options=options,
+        )
+
+    return _project
+
+
+@pytest.fixture(autouse=True)
+def _stub_reference_request_projection(monkeypatch):
+    """Agent 工具接线测试不访问真实供应商配置或项目资产文件。"""
+    from server.agent_runtime.sdk_tools import enqueue_videos as _mod
+
+    monkeypatch.setattr(_mod, "project_reference_unit_request", _fake_reference_projection())
 
 
 async def _call(tool_obj, args: dict[str, Any]) -> dict[str, Any]:
@@ -266,11 +355,13 @@ def _narration_audio_script() -> dict[str, Any]:
             {
                 "segment_id": "E1S01",
                 "novel_text": "却说天下大势，分久必合。",
+                "video_prompt": {},
                 "generated_assets": {},
             },
             {
                 "segment_id": "E1S02",
                 "novel_text": "话说周末七国分争。",
+                "video_prompt": {},
                 "generated_assets": {"narration_audio": "audio/segment_E1S02.wav"},
             },
         ],
@@ -309,7 +400,7 @@ async def test_generate_narration_audio_enqueues_missing_segments(fake_ctx: Tool
     spec = captured[0]
     assert spec.task_type == "tts"
     assert spec.media_type == "audio"
-    assert spec.payload["prompt"] == "却说天下大势，分久必合。"
+    assert spec.payload["prompt"] is None
     assert spec.payload["script_file"] == "episode_1.json"
     text = out["content"][0]["text"]
     assert "1 succeeded" in text
@@ -381,7 +472,7 @@ async def test_generate_narration_audio_blank_text_reported(fake_ctx: ToolContex
     from server.agent_runtime.sdk_tools import enqueue_narration_audio as mod
 
     script = _narration_audio_script()
-    script["segments"].append({"segment_id": "E1S03", "novel_text": "   ", "generated_assets": {}})
+    script["segments"].append({"segment_id": "E1S03", "novel_text": "   ", "video_prompt": {}, "generated_assets": {}})
     fake_ctx.pm.script_payload = script  # type: ignore[attr-defined]
     captured: list[Any] = []
 
@@ -436,56 +527,108 @@ async def test_generate_narration_audio_partial_unmatched_reported(fake_ctx: Too
     assert [s.resource_id for s in captured] == ["E1S01"]
     text = out["content"][0]["text"]
     assert "1 succeeded, 1 failed" in text
-    assert "E1S99" in text and "片段不存在" in text
+    assert "E1S99" in text and "单元不存在" in text
 
 
 @pytest.mark.unit
-async def test_generate_narration_audio_rejects_drama_script(fake_ctx: ToolContext) -> None:
+async def test_generate_narration_audio_accepts_drama_narrator_scene(
+    fake_ctx: ToolContext,
+    monkeypatch,
+) -> None:
     from server.agent_runtime.sdk_tools import enqueue_narration_audio as mod
 
+    fake_ctx.pm.project_payload["content_mode"] = "drama"  # type: ignore[attr-defined]
     fake_ctx.pm.script_payload = {  # type: ignore[attr-defined]
         "content_mode": "drama",
         "episode": 1,
-        "scenes": [{"scene_id": "E1S01", "generated_assets": {}}],
+        "scenes": [
+            {
+                "scene_id": "E1S01",
+                "utterances": [{"kind": "voiceover", "speaker": None, "text": "夜幕降临。"}],
+                "generated_assets": {},
+            }
+        ],
     }
+    captured: list[Any] = []
+
+    async def fake_batch(*, project_name, specs, on_success=None, on_failure=None):
+        del project_name, on_success, on_failure
+        captured.extend(specs)
+        return [], []
+
+    monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
     tool_obj = mod.generate_narration_audio_tool(fake_ctx)
     out = await _call(tool_obj, {"script": "episode_1.json"})
-    assert out.get("is_error") is True
-    assert "narration" in out["content"][0]["text"]
+    assert out.get("is_error") is not True, out
+    assert [spec.resource_id for spec in captured] == ["E1S01"]
+    assert captured[0].payload == {"prompt": None, "script_file": "episode_1.json"}
 
 
 @pytest.mark.integration
-async def test_generate_narration_audio_rejects_drama_script_without_content_mode(fake_ctx: ToolContext) -> None:
-    """剧本缺 content_mode 时按项目内容模式判适用性：drama 项目下同样拒绝，
-    而不是绕过模式检查落进「0 succeeded, 0 failed」的空转（scenes 没有 novel_text）。"""
+async def test_generate_narration_audio_uses_project_mode_for_drama_without_content_mode(
+    fake_ctx: ToolContext,
+    monkeypatch,
+) -> None:
     from server.agent_runtime.sdk_tools import enqueue_narration_audio as mod
 
     fake_ctx.pm.project_payload["content_mode"] = "drama"  # type: ignore[attr-defined]
     fake_ctx.pm.script_payload = {  # type: ignore[attr-defined]
         "episode": 1,
-        "scenes": [{"scene_id": "E1S01", "generated_assets": {}}],
+        "scenes": [
+            {
+                "scene_id": "E1S01",
+                "utterances": [{"kind": "voiceover", "speaker": None, "text": "夜幕降临。"}],
+                "generated_assets": {},
+            }
+        ],
     }
+    captured: list[Any] = []
+
+    async def fake_batch(*, project_name, specs, on_success=None, on_failure=None):
+        del project_name, on_success, on_failure
+        captured.extend(specs)
+        return [], []
+
+    monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
     tool_obj = mod.generate_narration_audio_tool(fake_ctx)
     out = await _call(tool_obj, {"script": "episode_1.json"})
-    assert out.get("is_error") is True
-    assert "narration" in out["content"][0]["text"]
+    assert out.get("is_error") is not True, out
+    assert [spec.resource_id for spec in captured] == ["E1S01"]
 
 
 @pytest.mark.integration
-async def test_generate_narration_audio_rejects_reference_route(fake_ctx: ToolContext) -> None:
-    """参考生视频路线无 segments，必须显式报错而非假装'已全部生成'。"""
+async def test_generate_narration_audio_accepts_reference_narrator_unit(
+    fake_ctx: ToolContext,
+    monkeypatch,
+) -> None:
     from server.agent_runtime.sdk_tools import enqueue_narration_audio as mod
 
     fake_ctx.pm.project_payload["generation_mode"] = "reference_video"  # type: ignore[attr-defined]
     fake_ctx.pm.script_payload = {  # type: ignore[attr-defined]
         "content_mode": "narration",
         "episode": 1,
-        "video_units": [{"unit_id": "E1U1"}],
+        "video_units": [
+            {
+                "unit_id": "E1U1",
+                "shots": [{"text": "镜头1：海面\n{风从远方吹来。}"}],
+                "references": [],
+                "duration_seconds": 8,
+                "generated_assets": {},
+            }
+        ],
     }
+    captured: list[Any] = []
+
+    async def fake_batch(*, project_name, specs, on_success=None, on_failure=None):
+        del project_name, on_success, on_failure
+        captured.extend(specs)
+        return [], []
+
+    monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
     tool_obj = mod.generate_narration_audio_tool(fake_ctx)
     out = await _call(tool_obj, {"script": "episode_1.json"})
-    assert out.get("is_error") is True
-    assert "reference_video" in out["content"][0]["text"]
+    assert out.get("is_error") is not True, out
+    assert [spec.resource_id for spec in captured] == ["E1U1"]
 
 
 @pytest.mark.integration
@@ -570,7 +713,7 @@ async def test_generate_narration_audio_skips_segment_without_id(fake_ctx: ToolC
     from server.agent_runtime.sdk_tools import enqueue_narration_audio as mod
 
     script = _narration_audio_script()
-    script["segments"].append({"novel_text": "有文本但缺 id 的片段。", "generated_assets": {}})
+    script["segments"].append({"novel_text": "有文本但缺 id 的片段。", "video_prompt": {}, "generated_assets": {}})
     fake_ctx.pm.script_payload = script  # type: ignore[attr-defined]
     captured: list[Any] = []
 
@@ -588,7 +731,7 @@ async def test_generate_narration_audio_skips_segment_without_id(fake_ctx: ToolC
 
     assert out.get("is_error") is not True, out
     assert [s.resource_id for s in captured] == ["E1S01"]
-    assert "跳过 1 个缺少 segment_id 的片段" in out["content"][0]["text"]
+    assert "跳过 1 个缺少 segment_id 的单元" in out["content"][0]["text"]
 
 
 @pytest.mark.unit
@@ -599,7 +742,7 @@ async def test_generate_narration_audio_no_match_error(fake_ctx: ToolContext) ->
     tool_obj = mod.generate_narration_audio_tool(fake_ctx)
     out = await _call(tool_obj, {"script": "episode_1.json", "segment_ids": ["NO_SUCH"]})
     assert out.get("is_error") is True
-    assert "没有找到匹配的片段" in out["content"][0]["text"]
+    assert "没有找到匹配的单元" in out["content"][0]["text"]
 
 
 @pytest.mark.unit
@@ -612,7 +755,7 @@ async def test_generate_narration_audio_all_done(fake_ctx: ToolContext) -> None:
     tool_obj = mod.generate_narration_audio_tool(fake_ctx)
     out = await _call(tool_obj, {"script": "episode_1.json"})
     assert out.get("is_error") is not True
-    assert "所有片段的旁白音频都已生成" in out["content"][0]["text"]
+    assert "所有 narrator 单元的旁白音频都已生成" in out["content"][0]["text"]
 
 
 @pytest.mark.unit
@@ -1036,6 +1179,185 @@ async def test_generate_grid_list_only(fake_ctx: ToolContext) -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("allow_large_grid", "expected", "forbidden"),
+    [(True, "grid_16 (4×4)", "grid_9"), (False, "grid_9 (3×3)", "grid_16")],
+)
+async def test_generate_grid_list_only_respects_4k_gate(
+    fake_ctx: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+    allow_large_grid: bool,
+    expected: str,
+    forbidden: str,
+) -> None:
+    # 非 4K 时 4×4 / 5×5 不出现在面向 agent 的分组预览里
+    fake_ctx.pm.project_payload["generation_mode"] = "storyboard"  # type: ignore[attr-defined]
+    fake_ctx.pm.project_payload["grid_storyboard"] = True  # type: ignore[attr-defined]
+    fake_ctx.pm.script_payload["segments"] = [  # type: ignore[attr-defined]
+        {"segment_id": f"E1S{i:02d}", "image_prompt": "p", "segment_break": False} for i in range(1, 13)
+    ]
+
+    async def _gate(_project: dict) -> bool:
+        return allow_large_grid
+
+    monkeypatch.setattr("server.agent_runtime.sdk_tools.enqueue_grid.resolve_large_grid_allowed", _gate)
+    tool_obj = generate_grid_tool(fake_ctx)
+    out = await _call(tool_obj, {"script": "episode_1.json", "list_only": True})
+    assert out.get("is_error") is not True
+    text = out["content"][0]["text"]
+    assert expected in text
+    assert forbidden not in text
+
+
+@pytest.mark.unit
+async def test_generate_grid_list_only_shows_split_for_oversized_group(
+    fake_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 超过单张格数上限的分组，预览按切块后的张数与档位展示，与实际入队同源
+    fake_ctx.pm.project_payload["generation_mode"] = "storyboard"  # type: ignore[attr-defined]
+    fake_ctx.pm.project_payload["grid_storyboard"] = True  # type: ignore[attr-defined]
+    fake_ctx.pm.script_payload["segments"] = [  # type: ignore[attr-defined]
+        {"segment_id": f"E1S{i:02d}", "image_prompt": "p", "segment_break": False} for i in range(1, 13)
+    ]
+
+    async def _gate(_project: dict) -> bool:
+        return False
+
+    monkeypatch.setattr("server.agent_runtime.sdk_tools.enqueue_grid.resolve_large_grid_allowed", _gate)
+    tool_obj = generate_grid_tool(fake_ctx)
+    out = await _call(tool_obj, {"script": "episode_1.json", "list_only": True})
+    assert out.get("is_error") is not True
+    text = out["content"][0]["text"]
+    assert "2 张宫格: grid_9 (3×3) + grid_4 (2×2)" in text
+
+
+@pytest.mark.unit
+async def test_generate_grid_falls_back_on_null_aspect_ratio(
+    fake_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # project.json 允许把 aspect_ratio 显式写为 null；SDK 入队路径须回退到默认比例，
+    # 否则 None 会写进宫格规划、任务 payload 与记录上冻结的比例
+    from lib.grid_manager import GridManager
+
+    fake_ctx.pm.project_payload["generation_mode"] = "storyboard"  # type: ignore[attr-defined]
+    fake_ctx.pm.project_payload["grid_storyboard"] = True  # type: ignore[attr-defined]
+    fake_ctx.pm.project_payload["aspect_ratio"] = None  # type: ignore[attr-defined]
+    fake_ctx.pm.script_payload["segments"] = [  # type: ignore[attr-defined]
+        {"segment_id": f"E1S0{i}", "image_prompt": "p", "segment_break": False} for i in range(1, 5)
+    ]
+
+    async def _gate(_project: dict) -> bool:
+        return False
+
+    payloads: list[dict[str, Any]] = []
+
+    async def fake_enqueue(*, project_name, task_type, media_type, resource_id, payload, script_file, source):
+        payloads.append(payload)
+        return {"task_id": "t1"}
+
+    async def fake_wait(_task_id: str) -> dict[str, Any]:
+        return {"status": "succeeded"}
+
+    async def fake_split(project_name: str, grid: Any) -> Any:
+        from server.services.grid_split import GridSplitResult
+
+        return GridSplitResult(updated_scene_ids=list(grid.scene_ids), missing_scene_ids=[], asset_fingerprints={})
+
+    monkeypatch.setattr("server.agent_runtime.sdk_tools.enqueue_grid.resolve_large_grid_allowed", _gate)
+    monkeypatch.setattr("server.agent_runtime.sdk_tools.enqueue_grid.enqueue_task_only", fake_enqueue)
+    monkeypatch.setattr("server.agent_runtime.sdk_tools.enqueue_grid.wait_for_task", fake_wait)
+    monkeypatch.setattr("server.agent_runtime.sdk_tools.enqueue_grid.apply_grid_split", fake_split)
+
+    tool_obj = generate_grid_tool(fake_ctx)
+    out = await _call(tool_obj, {"script": "episode_1.json"})
+    assert out.get("is_error") is not True
+
+    assert [p["video_aspect_ratio"] for p in payloads] == ["9:16"]
+    assert [g.video_aspect_ratio for g in GridManager(fake_ctx.project_path).list_all()] == ["9:16"]
+
+
+@pytest.mark.unit
+async def test_generate_grid_list_only_falls_back_on_null_aspect_ratio(
+    fake_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 预览路径与入队路径同源，同样不能让 None 流进 plan_grid_chunks
+    fake_ctx.pm.project_payload["generation_mode"] = "storyboard"  # type: ignore[attr-defined]
+    fake_ctx.pm.project_payload["grid_storyboard"] = True  # type: ignore[attr-defined]
+    fake_ctx.pm.project_payload["aspect_ratio"] = None  # type: ignore[attr-defined]
+    fake_ctx.pm.script_payload["segments"] = [  # type: ignore[attr-defined]
+        {"segment_id": f"E1S0{i}", "image_prompt": "p", "segment_break": False} for i in range(1, 5)
+    ]
+
+    async def _gate(_project: dict) -> bool:
+        return False
+
+    monkeypatch.setattr("server.agent_runtime.sdk_tools.enqueue_grid.resolve_large_grid_allowed", _gate)
+    tool_obj = generate_grid_tool(fake_ctx)
+    out = await _call(tool_obj, {"script": "episode_1.json", "list_only": True})
+    assert out.get("is_error") is not True
+    assert "grid_4 (2×2)" in out["content"][0]["text"]
+
+
+@pytest.mark.unit
+async def test_generate_grid_splits_oversized_group_into_multiple_grids(
+    fake_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 12 场景 + 非 4K（上限 9）：入队 2 张宫格，场景不重不漏，每张 prompt 场景数与格数一致
+    from lib.grid_manager import GridManager
+
+    fake_ctx.pm.project_payload["generation_mode"] = "storyboard"  # type: ignore[attr-defined]
+    fake_ctx.pm.project_payload["grid_storyboard"] = True  # type: ignore[attr-defined]
+    all_ids = [f"E1S{i:02d}" for i in range(1, 13)]
+    fake_ctx.pm.script_payload["segments"] = [  # type: ignore[attr-defined]
+        {"segment_id": sid, "image_prompt": "p", "video_prompt": "v", "segment_break": False} for sid in all_ids
+    ]
+
+    async def _gate(_project: dict) -> bool:
+        return False
+
+    payloads: list[dict[str, Any]] = []
+
+    async def fake_enqueue(*, project_name, task_type, media_type, resource_id, payload, script_file, source):
+        payloads.append(payload)
+        return {"task_id": f"t{len(payloads)}"}
+
+    async def fake_wait(_task_id: str) -> dict[str, Any]:
+        return {"status": "succeeded"}
+
+    # 生成成功后工具会对每张宫格显式调用切分；此处替换为假实现，单独锁定入队分块行为
+    split_calls: list[str] = []
+
+    async def fake_split(project_name: str, grid: Any) -> Any:
+        from server.services.grid_split import GridSplitResult
+
+        split_calls.append(grid.id)
+        return GridSplitResult(updated_scene_ids=list(grid.scene_ids), missing_scene_ids=[], asset_fingerprints={})
+
+    monkeypatch.setattr("server.agent_runtime.sdk_tools.enqueue_grid.resolve_large_grid_allowed", _gate)
+    monkeypatch.setattr("server.agent_runtime.sdk_tools.enqueue_grid.enqueue_task_only", fake_enqueue)
+    monkeypatch.setattr("server.agent_runtime.sdk_tools.enqueue_grid.wait_for_task", fake_wait)
+    monkeypatch.setattr("server.agent_runtime.sdk_tools.enqueue_grid.apply_grid_split", fake_split)
+
+    tool_obj = generate_grid_tool(fake_ctx)
+    out = await _call(tool_obj, {"script": "episode_1.json"})
+    assert out.get("is_error") is not True
+    # 每张生成成功的宫格都被显式切分
+    assert len(split_calls) == 2
+
+    assert [(len(p["scene_ids"]), p["grid_size"]) for p in payloads] == [(9, "grid_9"), (3, "grid_4")]
+    # 场景不重不漏且保持顺序
+    assert [sid for p in payloads for sid in p["scene_ids"]] == all_ids
+    # 每张的 prompt 按自身块与档位构建
+    assert "3×3" in payloads[0]["prompt"]
+    assert "2×2" in payloads[1]["prompt"]
+
+    # 落盘的 grid 记录与 payload 一致，帧链长度等于格数
+    grids = sorted(GridManager(fake_ctx.project_path).list_all(), key=lambda g: len(g.scene_ids), reverse=True)
+    assert [(g.scene_ids, g.rows, g.cols) for g in grids] == [(all_ids[:9], 3, 3), (all_ids[9:], 2, 2)]
+    assert all(len(g.frame_chain) == g.rows * g.cols for g in grids)
+
+
+@pytest.mark.unit
 async def test_generate_grid_wrong_mode(fake_ctx: ToolContext) -> None:
     # 项目未开启 grid_storyboard → error
     tool_obj = generate_grid_tool(fake_ctx)
@@ -1179,7 +1501,7 @@ async def test_generate_video_episode_reference_duration_needs_confirmation(fake
     _use_reference_route(fake_ctx)
     fake_ctx.pm.script_payload = _reference_video_script()  # type: ignore[attr-defined]
 
-    def fake_precheck(ctx, unit, ad_shots):
+    def fake_precheck(ctx, unit):
         return DurationSlot(seconds=8, total_seconds=5, adjustment=UP)
 
     enqueued: list[Any] = []
@@ -1191,9 +1513,12 @@ async def test_generate_video_episode_reference_duration_needs_confirmation(fake
     async def fake_duration_context(_project, _episode=None, *, capability=None):
         return None
 
-    monkeypatch.setattr(mod, "resolve_project_duration_context", fake_duration_context)
-    monkeypatch.setattr(mod, "precheck_unit", fake_precheck)
+    async def fake_active_tasks(**_kwargs):
+        return []
+
+    monkeypatch.setattr(mod, "project_reference_unit_request", _fake_reference_projection(fake_precheck))
     monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
+    monkeypatch.setattr(mod, "get_active_tasks_for_resources", fake_active_tasks)
 
     tool_obj = generate_video_episode_tool(fake_ctx)
     out = await _call(tool_obj, {"script": "episode_1.json"})
@@ -1202,13 +1527,138 @@ async def test_generate_video_episode_reference_duration_needs_confirmation(fake
     text = out["content"][0]["text"]
     assert "E1U1" in text
     assert "5" in text and "8" in text
-    assert "confirm_duration" in text
+    assert "费用" in text and "本次请求" in text
+    assert "confirmed_request_duration_seconds" in text
+    projection = out["request_projections"][0]
+    assert projection == {
+        "allowed": False,
+        "kind": "reference_request_projection",
+        "advisory": True,
+        "unit_id": "E1U1",
+        "declared_capability": "r2v",
+        "hydrated_capability": "r2v",
+        "provider_id": "fake",
+        "model_id": "fake-r2v",
+        "planned_duration": 5,
+        "current_visual_duration": None,
+        "duration_input": 5,
+        "request_duration": 8,
+        "problems": [
+            {
+                "code": "reference_duration_confirmation_required",
+                "blocking": True,
+                "unit_id": "E1U1",
+                "locations": [{"path": ["duration_seconds"], "line": None}],
+                "params": {
+                    "script_duration": 5,
+                    "duration_input": 5,
+                    "request_duration": 8,
+                    "adjustment": "up",
+                    "current_visual_duration": None,
+                },
+                "action": "confirm_duration",
+            }
+        ],
+    }
     assert enqueued == []
 
 
 @pytest.mark.integration
+async def test_generate_video_episode_reference_returns_structured_projection_blocker(
+    fake_ctx: ToolContext,
+    monkeypatch,
+) -> None:
+    """Agent 失败信封保留公共投影的稳定 problem 字段，不只返回人读文本。"""
+    from lib.reference_video.request_projection import ProjectionProblem
+    from server.agent_runtime.sdk_tools import enqueue_videos as mod
+
+    _use_reference_route(fake_ctx)
+    fake_ctx.pm.script_payload = _reference_video_script()  # type: ignore[attr-defined]
+
+    class _BlockedProjection:
+        unit_id = "E1U1"
+        blocking_problems = (
+            ProjectionProblem(
+                code="reference_supported_durations_missing",
+                blocking=True,
+                params=(("provider", "fake"), ("model", "fake-model")),
+            ),
+        )
+
+        def to_advisory_payload(self):
+            return {
+                "allowed": False,
+                "kind": "reference_request_projection",
+                "advisory": True,
+                "unit_id": self.unit_id,
+                "declared_capability": "i2v",
+                "hydrated_capability": "i2v",
+                "provider_id": None,
+                "model_id": None,
+                "planned_duration": 5,
+                "duration_input": 5,
+                "request_duration": None,
+                "problems": [problem.to_payload(unit_id=self.unit_id) for problem in self.blocking_problems],
+            }
+
+    async def _blocked(**_kwargs):
+        return _BlockedProjection()
+
+    monkeypatch.setattr(mod, "project_reference_unit_request", _blocked)
+
+    out = await _call(mod.generate_video_episode_tool(fake_ctx), {"script": "episode_1.json"})
+
+    assert out.get("is_error") is True
+    assert out["request_projection"] == {
+        "allowed": False,
+        "kind": "reference_request_projection",
+        "advisory": True,
+        "unit_id": "E1U1",
+        "declared_capability": "i2v",
+        "hydrated_capability": "i2v",
+        "provider_id": None,
+        "model_id": None,
+        "planned_duration": 5,
+        "duration_input": 5,
+        "request_duration": None,
+        "problems": [
+            {
+                "code": "reference_supported_durations_missing",
+                "blocking": True,
+                "unit_id": "E1U1",
+                "locations": [{"path": ["duration_seconds"], "line": None}],
+                "params": {"provider": "fake", "model": "fake-model"},
+                "action": "configure_video_model",
+            }
+        ],
+    }
+
+
+@pytest.mark.unit
+def test_only_single_video_agent_tool_exposes_narration_delivery(fake_ctx: ToolContext) -> None:
+    batch_tools = (
+        generate_video_episode_tool(fake_ctx),
+        generate_video_all_tool(fake_ctx),
+        generate_video_selected_tool(fake_ctx),
+    )
+
+    for tool_obj in batch_tools:
+        schema = tool_obj.input_schema
+        assert isinstance(schema, dict)
+        properties = schema.get("properties")
+        assert isinstance(properties, dict)
+        assert "narration_delivery" not in properties
+        assert "confirmed_request_duration_seconds" in properties
+    scene_schema = generate_video_scene_tool(fake_ctx).input_schema
+    assert isinstance(scene_schema, dict)
+    scene_properties = scene_schema.get("properties")
+    assert isinstance(scene_properties, dict)
+    assert "narration_delivery" in scene_properties
+
+
+@pytest.mark.integration
 async def test_generate_video_episode_reference_duration_confirm_enqueues(fake_ctx: ToolContext, monkeypatch) -> None:
-    """带 confirm_duration=true 的再次调用按取档结果入队并生成成功。"""
+    """带精确申请档位的再次调用按取档结果入队并生成成功。"""
     from lib.generation_queue_client import BatchTaskResult
     from lib.reference_video.duration_slots import UP, DurationSlot
     from server.agent_runtime.sdk_tools import enqueue_videos as mod
@@ -1216,7 +1666,7 @@ async def test_generate_video_episode_reference_duration_confirm_enqueues(fake_c
     _use_reference_route(fake_ctx)
     fake_ctx.pm.script_payload = _reference_video_script()  # type: ignore[attr-defined]
 
-    def fake_precheck(ctx, unit, ad_shots):
+    def fake_precheck(ctx, unit):
         return DurationSlot(seconds=8, total_seconds=5, adjustment=UP)
 
     enqueued: list[Any] = []
@@ -1238,15 +1688,89 @@ async def test_generate_video_episode_reference_duration_confirm_enqueues(fake_c
     async def fake_duration_context(_project, _episode=None, *, capability=None):
         return None
 
-    monkeypatch.setattr(mod, "resolve_project_duration_context", fake_duration_context)
-    monkeypatch.setattr(mod, "precheck_unit", fake_precheck)
+    monkeypatch.setattr(mod, "project_reference_unit_request", _fake_reference_projection(fake_precheck))
     monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
 
     tool_obj = generate_video_episode_tool(fake_ctx)
-    out = await _call(tool_obj, {"script": "episode_1.json", "confirm_duration": True})
+    out = await _call(
+        tool_obj,
+        {"script": "episode_1.json", "confirmed_request_duration_seconds": 8},
+    )
 
     assert out.get("is_error") is not True, out
     assert [s.resource_id for s in enqueued] == ["E1U1"]
+
+
+@pytest.mark.integration
+async def test_generate_video_episode_reference_ignores_out_of_schema_tts_choice(
+    fake_ctx: ToolContext,
+    monkeypatch,
+) -> None:
+    from lib.generation_queue_client import BatchTaskResult
+    from server.agent_runtime.sdk_tools import enqueue_videos as mod
+
+    _use_reference_route(fake_ctx)
+    fake_ctx.pm.script_payload = _reference_video_script()  # type: ignore[attr-defined]
+
+    enqueued: list[Any] = []
+
+    async def fake_batch(*, project_name, specs, on_success=None, on_failure=None):
+        del project_name, on_failure
+        for spec in specs:
+            enqueued.append(spec)
+            if on_success:
+                on_success(
+                    BatchTaskResult(
+                        resource_id=spec.resource_id,
+                        task_id="t1",
+                        status="succeeded",
+                        result={"file_path": f"reference_videos/{spec.resource_id}.mp4"},
+                    )
+                )
+        return [], []
+
+    projected_deliveries: list[str] = []
+    base_projection = _fake_reference_projection()
+
+    async def _capture_delivery(**kwargs):
+        projected_deliveries.append(kwargs["options"].narration_delivery)
+        return await base_projection(**kwargs)
+
+    active_tts = AsyncMock(return_value=frozenset())
+    monkeypatch.setattr(mod, "project_reference_unit_request", _capture_delivery)
+    monkeypatch.setattr(mod, "active_tts_resource_ids", active_tts)
+    monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
+    tool_obj = generate_video_episode_tool(fake_ctx)
+
+    completed = await _call(
+        tool_obj,
+        {"script": "episode_1.json", "narration_delivery": "use_tts"},
+    )
+
+    assert completed.get("is_error") is not True
+    assert projected_deliveries == ["post_production"]
+    active_tts.assert_not_awaited()
+    assert enqueued[0].payload["reference_request_options"] == {
+        "narration_delivery": "post_production",
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "invalid_confirmation",
+    [0, -1, 9.5, True, "12"],
+    ids=["zero", "negative", "fraction", "boolean", "string"],
+)
+def test_reference_request_options_rejects_invalid_confirmed_duration(invalid_confirmation: object) -> None:
+    from server.agent_runtime.sdk_tools.enqueue_videos import _reference_request_options
+
+    with pytest.raises(ValueError, match="confirmed_request_duration_seconds 必须是大于 0 的整数秒档位"):
+        _reference_request_options(
+            {
+                "narration_delivery": "use_tts",
+                "confirmed_request_duration_seconds": invalid_confirmation,
+            }
+        )
 
 
 @pytest.mark.integration
@@ -1260,7 +1784,7 @@ async def test_generate_video_episode_reference_duration_repeat_without_confirm_
     _use_reference_route(fake_ctx)
     fake_ctx.pm.script_payload = _reference_video_script()  # type: ignore[attr-defined]
 
-    def fake_precheck(ctx, unit, ad_shots):
+    def fake_precheck(ctx, unit):
         return DurationSlot(seconds=8, total_seconds=5, adjustment=UP)
 
     enqueued: list[Any] = []
@@ -1272,8 +1796,7 @@ async def test_generate_video_episode_reference_duration_repeat_without_confirm_
     async def fake_duration_context(_project, _episode=None, *, capability=None):
         return None
 
-    monkeypatch.setattr(mod, "resolve_project_duration_context", fake_duration_context)
-    monkeypatch.setattr(mod, "precheck_unit", fake_precheck)
+    monkeypatch.setattr(mod, "project_reference_unit_request", _fake_reference_projection(fake_precheck))
     monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
 
     tool_obj = generate_video_episode_tool(fake_ctx)
@@ -1295,7 +1818,7 @@ async def test_generate_video_episode_reference_duration_exact_enqueues_directly
     _use_reference_route(fake_ctx)
     fake_ctx.pm.script_payload = _reference_video_script()  # type: ignore[attr-defined]
 
-    def fake_precheck(ctx, unit, ad_shots):
+    def fake_precheck(ctx, unit):
         return DurationSlot(seconds=5, total_seconds=5, adjustment=EXACT)
 
     enqueued: list[Any] = []
@@ -1319,8 +1842,7 @@ async def test_generate_video_episode_reference_duration_exact_enqueues_directly
     async def fake_duration_context(_project, _episode=None, *, capability=None):
         return None
 
-    monkeypatch.setattr(mod, "resolve_project_duration_context", fake_duration_context)
-    monkeypatch.setattr(mod, "precheck_unit", fake_precheck)
+    monkeypatch.setattr(mod, "project_reference_unit_request", _fake_reference_projection(fake_precheck))
     monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
 
     tool_obj = generate_video_episode_tool(fake_ctx)
@@ -1350,7 +1872,7 @@ async def test_generate_video_episode_reference_duration_skips_unit_without_shot
 
     precheck_calls: list[str] = []
 
-    def fake_precheck(ctx, unit, ad_shots):
+    def fake_precheck(ctx, unit):
         precheck_calls.append(unit["unit_id"])
         return DurationSlot(seconds=5, total_seconds=5, adjustment=EXACT)
 
@@ -1375,8 +1897,7 @@ async def test_generate_video_episode_reference_duration_skips_unit_without_shot
     async def fake_duration_context(_project, _episode=None, *, capability=None):
         return None
 
-    monkeypatch.setattr(mod, "resolve_project_duration_context", fake_duration_context)
-    monkeypatch.setattr(mod, "precheck_unit", fake_precheck)
+    monkeypatch.setattr(mod, "project_reference_unit_request", _fake_reference_projection(fake_precheck))
     monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
 
     tool_obj = generate_video_episode_tool(fake_ctx)
@@ -1392,13 +1913,9 @@ async def test_generate_video_episode_reference_duration_skips_unit_without_shot
 async def test_generate_video_episode_reference_duration_resolves_project_context_once(
     fake_ctx: ToolContext, monkeypatch
 ) -> None:
-    """批量预检时项目视频能力/分辨率按能力桶至多各解析一次，逐 unit 取档走纯函数 precheck_unit。
-
-    unit 按声明的参考集分桶：有参考图 → r2v，无参考图退化镜头 → i2v，与执行侧同口径。
-    同桶多 unit 复用同一次解析，不逐 unit 触发 DB 往返。
-    """
+    """批量预检让每个可入队 unit 都经过公共 request projection。"""
+    from lib.reference_video.duration_slots import UP, DurationSlot
     from server.agent_runtime.sdk_tools import enqueue_videos as mod
-    from server.services.reference_video_tasks import ProjectDurationContext
 
     script = _reference_video_script()
     script["video_units"].append(
@@ -1422,9 +1939,8 @@ async def test_generate_video_episode_reference_duration_resolves_project_contex
 
     context_calls: list[Any] = []
 
-    async def fake_duration_context(project, _episode=None, *, capability=None):
-        context_calls.append(capability)
-        return ProjectDurationContext(supported_durations=(4, 8, 12), resolution=None, provider_id="", model_name=None)
+    def fake_precheck(_ctx, _unit):
+        return DurationSlot(seconds=8, total_seconds=5, adjustment=UP)
 
     enqueued: list[Any] = []
 
@@ -1432,16 +1948,19 @@ async def test_generate_video_episode_reference_duration_resolves_project_contex
         enqueued.extend(specs)
         return [], []
 
-    monkeypatch.setattr(mod, "resolve_project_duration_context", fake_duration_context)
+    monkeypatch.setattr(
+        mod,
+        "project_reference_unit_request",
+        _fake_reference_projection(fake_precheck, calls=context_calls),
+    )
     monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
 
     tool_obj = generate_video_episode_tool(fake_ctx)
     out = await _call(tool_obj, {"script": "episode_1.json"})
 
-    # 三个 unit 均 5 秒、档位无 5 → 都需确认，本批不入队；两个带参考图 unit 共用一次
-    # r2v 解析，无参考图 unit 单独触发一次 i2v 解析——既验证分桶传递，也验证按桶缓存。
+    # 三个 unit 均 5 秒、申请 8 秒 → 都需确认，本批不入队；实际水合桶随每个结果可观察。
     assert out.get("is_error") is not True, out
-    assert context_calls == ["r2v", "i2v"]
+    assert context_calls == ["r2v", "r2v", "i2v"]
     assert enqueued == []
 
 
@@ -1459,22 +1978,18 @@ async def test_generate_video_episode_reference_skips_duration_context_when_noth
     _use_reference_route(fake_ctx)
     fake_ctx.pm.script_payload = script  # type: ignore[attr-defined]
 
-    context_calls: list[dict[str, Any]] = []
-
-    async def fake_duration_context(project, _episode=None, *, capability=None):
-        context_calls.append(project)
-        raise AssertionError("无可预检 unit 时不应解析项目视频能力")
+    projection_calls: list[str] = []
 
     async def fake_batch(*, project_name, specs, on_success=None, on_failure=None):
         return [], []
 
-    monkeypatch.setattr(mod, "resolve_project_duration_context", fake_duration_context)
+    monkeypatch.setattr(mod, "project_reference_unit_request", _fake_reference_projection(calls=projection_calls))
     monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
 
     tool_obj = generate_video_episode_tool(fake_ctx)
     await _call(tool_obj, {"script": "episode_1.json"})
 
-    assert context_calls == []
+    assert projection_calls == []
 
 
 @pytest.mark.integration
@@ -1482,7 +1997,7 @@ async def test_generate_video_episode_reference_skips_duration_context_when_prom
     fake_ctx: ToolContext, monkeypatch
 ) -> None:
     """shots 非空但拼接后提示词全空白时，build_specs 会拒绝该 unit——预检须复用同一份
-    结构校验提前判定，不能先触发项目能力解析再让 build_specs 事后跳过（见 Codex review）。"""
+    结构校验提前判定，不能先触发项目能力解析再让 build_specs 事后跳过。"""
     from server.agent_runtime.sdk_tools import enqueue_videos as mod
 
     script = _reference_video_script()
@@ -1491,22 +2006,18 @@ async def test_generate_video_episode_reference_skips_duration_context_when_prom
     _use_reference_route(fake_ctx)
     fake_ctx.pm.script_payload = script  # type: ignore[attr-defined]
 
-    context_calls: list[dict[str, Any]] = []
-
-    async def fake_duration_context(project, _episode=None, *, capability=None):
-        context_calls.append(project)
-        raise AssertionError("整批提示词均空白时不应解析项目视频能力")
+    projection_calls: list[str] = []
 
     async def fake_batch(*, project_name, specs, on_success=None, on_failure=None):
         return [], []
 
-    monkeypatch.setattr(mod, "resolve_project_duration_context", fake_duration_context)
+    monkeypatch.setattr(mod, "project_reference_unit_request", _fake_reference_projection(calls=projection_calls))
     monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
 
     tool_obj = generate_video_episode_tool(fake_ctx)
     out = await _call(tool_obj, {"script": "episode_1.json"})
 
-    assert context_calls == []
+    assert projection_calls == []
     assert "E1U1" in out["content"][0]["text"]
 
 
@@ -1514,14 +2025,14 @@ async def test_generate_video_episode_reference_skips_duration_context_when_prom
 async def test_generate_video_episode_ad_reference_duration_needs_confirmation(
     ad_reference_ctx: ToolContext, monkeypatch
 ) -> None:
-    """ad 参考直出走同一条确认闸门，且预检拿到的是水合后的成员镜头（ad_shots 非空）。"""
+    """ad 参考直出走同一条 unit 时长确认闸门。"""
     from lib.reference_video.duration_slots import UP, DurationSlot
     from server.agent_runtime.sdk_tools import enqueue_videos as mod
 
-    seen_ad_shots: list[Any] = []
+    seen_units: list[dict[str, Any]] = []
 
-    def fake_precheck(ctx, unit, ad_shots):
-        seen_ad_shots.append(ad_shots)
+    def fake_precheck(ctx, unit):
+        seen_units.append(unit)
         return DurationSlot(seconds=8, total_seconds=5, adjustment=UP)
 
     enqueued: list[Any] = []
@@ -1533,8 +2044,7 @@ async def test_generate_video_episode_ad_reference_duration_needs_confirmation(
     async def fake_duration_context(_project, _episode=None, *, capability=None):
         return None
 
-    monkeypatch.setattr(mod, "resolve_project_duration_context", fake_duration_context)
-    monkeypatch.setattr(mod, "precheck_unit", fake_precheck)
+    monkeypatch.setattr(mod, "project_reference_unit_request", _fake_reference_projection(fake_precheck))
     monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
 
     tool_obj = generate_video_episode_tool(ad_reference_ctx)
@@ -1542,27 +2052,23 @@ async def test_generate_video_episode_ad_reference_duration_needs_confirmation(
 
     assert out.get("is_error") is not True, out
     assert enqueued == []
-    assert seen_ad_shots and seen_ad_shots[0]
+    assert [unit["unit_id"] for unit in seen_units] == ["E1U1"]
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
     ("make_tool", "extra_args"),
     [
-        (generate_video_scene_tool, {"scene_id": "E1S01"}),
+        (generate_video_scene_tool, {"scene_id": "E1U1"}),
         (generate_video_all_tool, {}),
-        (generate_video_selected_tool, {"scene_ids": ["E1S01"]}),
+        (generate_video_selected_tool, {"scene_ids": ["E1U1"]}),
     ],
     ids=["scene", "all", "selected"],
 )
 async def test_generate_video_reference_duration_confirmation_across_entries(
     fake_ctx: ToolContext, monkeypatch, make_tool, extra_args: dict[str, Any]
 ) -> None:
-    """四个入口在 reference 路径下共用同一条确认闸门：未确认不入队、确认后入队。
-
-    确认文本必须保留本次已产生的 log——scene / selected 的「scene_id 被忽略，转整集生成」
-    正是靠它告诉用户，他同意的是整集而非所选的那个 scene。
-    """
+    """reference 路径的整集与点名入口共用确认闸门：未确认不入队、确认后入队。"""
     from lib.generation_queue_client import BatchTaskResult
     from lib.reference_video.duration_slots import UP, DurationSlot
     from server.agent_runtime.sdk_tools import enqueue_videos as mod
@@ -1570,7 +2076,7 @@ async def test_generate_video_reference_duration_confirmation_across_entries(
     _use_reference_route(fake_ctx)
     fake_ctx.pm.script_payload = _reference_video_script()  # type: ignore[attr-defined]
 
-    def fake_precheck(ctx, unit, ad_shots):
+    def fake_precheck(ctx, unit):
         return DurationSlot(seconds=8, total_seconds=5, adjustment=UP)
 
     enqueued: list[Any] = []
@@ -1592,9 +2098,12 @@ async def test_generate_video_reference_duration_confirmation_across_entries(
     async def fake_duration_context(_project, _episode=None, *, capability=None):
         return None
 
-    monkeypatch.setattr(mod, "resolve_project_duration_context", fake_duration_context)
-    monkeypatch.setattr(mod, "precheck_unit", fake_precheck)
+    async def fake_active_tasks(**_kwargs):
+        return []
+
+    monkeypatch.setattr(mod, "project_reference_unit_request", _fake_reference_projection(fake_precheck))
     monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
+    monkeypatch.setattr(mod, "get_active_tasks_for_resources", fake_active_tasks)
 
     tool_obj = make_tool(fake_ctx)
     pending = await _call(tool_obj, {"script": "episode_1.json", **extra_args})
@@ -1602,14 +2111,101 @@ async def test_generate_video_reference_duration_confirmation_across_entries(
     assert pending.get("is_error") is not True, pending
     assert enqueued == []
     text = pending["content"][0]["text"]
-    assert "confirm_duration" in text
-    if make_tool is not generate_video_all_tool:
-        assert "转整集生成" in text
+    assert "费用" in text and "本次请求" in text
+    assert "confirmed_request_duration_seconds" in text
 
-    confirmed = await _call(tool_obj, {"script": "episode_1.json", **extra_args, "confirm_duration": True})
+    confirmed = await _call(
+        tool_obj,
+        {"script": "episode_1.json", **extra_args, "confirmed_request_duration_seconds": 8},
+    )
 
     assert confirmed.get("is_error") is not True, confirmed
     assert [s.resource_id for s in enqueued] == ["E1U1"]
+
+
+@pytest.mark.integration
+async def test_generate_video_scene_reference_use_tts_exposes_the_shared_cross_tier_quote(
+    fake_ctx: ToolContext,
+    monkeypatch,
+) -> None:
+    from lib.generation_queue_client import BatchTaskResult
+    from lib.reference_video.duration_slots import EXACT, DurationSlot
+    from server.agent_runtime.sdk_tools import enqueue_videos as mod
+    from server.services.cost_estimation import VideoRequestQuote
+
+    _use_reference_route(fake_ctx)
+    fake_ctx.pm.script_payload = _reference_video_script()  # type: ignore[attr-defined]
+
+    def fake_precheck(_ctx, _unit):
+        return DurationSlot(seconds=8, total_seconds=8, adjustment=EXACT)
+
+    async def _current_options(**kwargs):
+        return replace(
+            kwargs["options"],
+            current_tts_duration_seconds=8.0,
+            current_visual_duration_seconds=4,
+        )
+
+    enqueued: list[Any] = []
+
+    async def fake_batch(*, project_name, specs, on_success=None, on_failure=None):
+        del project_name, on_failure
+        for spec in specs:
+            enqueued.append(spec)
+            if on_success:
+                on_success(
+                    BatchTaskResult(
+                        resource_id=spec.resource_id,
+                        task_id="t1",
+                        status="succeeded",
+                        result={"file_path": f"reference_videos/{spec.resource_id}.mp4"},
+                    )
+                )
+        return [], []
+
+    monkeypatch.setattr(mod, "prepare_current_reference_video_request_options", _current_options)
+    monkeypatch.setattr(mod, "project_reference_unit_request", _fake_reference_projection(fake_precheck))
+    monkeypatch.setattr(mod, "active_tts_resource_ids", AsyncMock(return_value=frozenset()))
+    monkeypatch.setattr(mod, "get_active_tasks_for_resources", AsyncMock(return_value=[]))
+    monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
+    monkeypatch.setattr(
+        mod,
+        "quote_video_request",
+        AsyncMock(return_value=VideoRequestQuote(0.8, "USD", "fake", "fake-r2v", 8)),
+    )
+    tool_obj = generate_video_scene_tool(fake_ctx)
+
+    pending = await _call(
+        tool_obj,
+        {"script": "episode_1.json", "scene_id": "E1U1", "narration_delivery": "use_tts"},
+    )
+
+    assert pending.get("is_error") is not True, pending
+    assert pending["request_projections"][0]["request_cost"] == {
+        "amount": 0.8,
+        "currency": "USD",
+        "provider_id": "fake",
+        "model_id": "fake-r2v",
+        "request_duration_seconds": 8,
+    }
+    assert "0.8 USD" in pending["content"][0]["text"]
+    assert "现有视觉档位 4s，将申请 8s（成片更长 4s）" in pending["content"][0]["text"]
+    assert enqueued == []
+
+    accepted = await _call(
+        tool_obj,
+        {
+            "script": "episode_1.json",
+            "scene_id": "E1U1",
+            "narration_delivery": "use_tts",
+            "confirmed_request_duration_seconds": 8,
+        },
+    )
+    assert accepted.get("is_error") is not True, accepted
+    assert enqueued[0].payload["reference_request_options"] == {
+        "narration_delivery": "use_tts",
+        "confirmed_request_duration_seconds": 8,
+    }
 
 
 @pytest.mark.unit
@@ -1623,6 +2219,314 @@ async def test_generate_video_scene_happy(fake_ctx: ToolContext, monkeypatch) ->
     tool_obj = generate_video_scene_tool(fake_ctx)
     out = await _call(tool_obj, {"script": "episode_1.json", "scene_id": "E1S01"})
     assert out.get("is_error") is not True
+
+
+@pytest.mark.integration
+async def test_generate_video_scene_use_tts_returns_structured_blocker_without_enqueuing(
+    fake_ctx: ToolContext, monkeypatch
+) -> None:
+    from lib.narration_delivery import (
+        USE_TTS,
+        NarrationDeliveryPreparation,
+        NarrationDeliveryProblem,
+        NarrationTtsStatus,
+        prepare_narrated_video_duration,
+    )
+    from server.agent_runtime.sdk_tools import enqueue_videos as mod
+
+    async def fake_prepare(**kwargs):
+        narration = NarrationDeliveryPreparation(
+            delivery=USE_TTS,
+            unit_id="E1S01",
+            speech_mode=None,
+            tts_status=NarrationTtsStatus.MISSING,
+            artifact_path="audio/segment_E1S01.wav",
+            basis_digest="basis",
+            actual_duration_seconds=None,
+            problems=(
+                NarrationDeliveryProblem(
+                    code="tts_missing",
+                    reason="tts_audio_missing",
+                    action="generate_tts",
+                    locations=(),
+                ),
+            ),
+        )
+        return prepare_narrated_video_duration(
+            narration=narration,
+            planned_duration_seconds=4,
+            supported_durations=(4, 8, 12),
+            confirmed_request_duration_seconds=kwargs["confirmed_request_duration_seconds"],
+        )
+
+    enqueue = AsyncMock()
+    monkeypatch.setattr(mod, "active_tts_resource_ids", AsyncMock(return_value=frozenset()))
+    monkeypatch.setattr(mod, "_prepare_storyboard_delivery_for_item", fake_prepare, raising=False)
+    monkeypatch.setattr(mod, "enqueue_and_wait", enqueue)
+
+    out = await _call(
+        generate_video_scene_tool(fake_ctx),
+        {"script": "episode_1.json", "scene_id": "E1S01", "narration_delivery": "use_tts"},
+    )
+
+    assert out["is_error"] is True
+    assert out["request_projection"]["problems"][0]["code"] == "tts_missing"
+    enqueue.assert_not_awaited()
+
+
+@pytest.mark.integration
+async def test_generate_video_scene_use_tts_requires_exact_tier_and_queues_only_request_facts(
+    fake_ctx: ToolContext, monkeypatch
+) -> None:
+    from lib.narration_delivery import (
+        USE_TTS,
+        NarrationDeliveryPreparation,
+        NarrationTtsStatus,
+        VideoRequestCostFacts,
+        prepare_narrated_video_duration,
+    )
+    from server.agent_runtime.sdk_tools import enqueue_videos as mod
+    from server.services.cost_estimation import VideoRequestQuote
+
+    async def fake_prepare(**kwargs):
+        narration = NarrationDeliveryPreparation(
+            delivery=USE_TTS,
+            unit_id="E1S01",
+            speech_mode=None,
+            tts_status=NarrationTtsStatus.CURRENT,
+            artifact_path="audio/segment_E1S01.wav",
+            basis_digest="basis",
+            actual_duration_seconds=9.5,
+            problems=(),
+        )
+        return replace(
+            prepare_narrated_video_duration(
+                narration=narration,
+                planned_duration_seconds=4,
+                supported_durations=(4, 8, 12),
+                confirmed_request_duration_seconds=kwargs["confirmed_request_duration_seconds"],
+            ),
+            cost=VideoRequestCostFacts("openai", "sora-2", "720p", 12, True),
+        )
+
+    enqueue = AsyncMock(return_value={"task": {}, "result": {"file_path": "videos/scene_E1S01.mp4"}})
+    monkeypatch.setattr(mod, "active_tts_resource_ids", AsyncMock(return_value=frozenset()))
+    monkeypatch.setattr(mod, "_prepare_storyboard_delivery_for_item", fake_prepare, raising=False)
+    monkeypatch.setattr(
+        mod,
+        "quote_video_request",
+        AsyncMock(return_value=VideoRequestQuote(1.2, "USD", "openai", "sora-2", 12)),
+    )
+    monkeypatch.setattr(mod, "enqueue_and_wait", enqueue)
+    tool_obj = generate_video_scene_tool(fake_ctx)
+
+    pending = await _call(
+        tool_obj,
+        {"script": "episode_1.json", "scene_id": "E1S01", "narration_delivery": "use_tts"},
+    )
+    assert pending.get("is_error") is not True
+    assert pending["request_projections"][0]["problems"][0]["code"] == "reference_duration_confirmation_required"
+    assert pending["request_projections"][0]["request_cost"] == {
+        "amount": 1.2,
+        "currency": "USD",
+        "provider_id": "openai",
+        "model_id": "sora-2",
+        "request_duration_seconds": 12,
+    }
+    assert "1.2 USD" in pending["content"][0]["text"]
+    enqueue.assert_not_awaited()
+
+    completed = await _call(
+        tool_obj,
+        {
+            "script": "episode_1.json",
+            "scene_id": "E1S01",
+            "narration_delivery": "use_tts",
+            "confirmed_request_duration_seconds": 12,
+        },
+    )
+
+    assert completed.get("is_error") is not True
+    payload = enqueue.await_args.kwargs["payload"]
+    assert "duration_seconds" not in payload
+    assert payload["narration_delivery_options"] == {
+        "narration_delivery": "use_tts",
+        "confirmed_request_duration_seconds": 12,
+    }
+    assert "basis_digest" not in payload["narration_delivery_options"]
+    assert "actual_duration_seconds" not in payload["narration_delivery_options"]
+
+
+@pytest.mark.integration
+async def test_generate_video_scene_use_tts_blocks_when_exact_cost_is_unavailable(
+    fake_ctx: ToolContext,
+    monkeypatch,
+) -> None:
+    from lib.narration_delivery import (
+        USE_TTS,
+        NarrationDeliveryPreparation,
+        NarrationTtsStatus,
+        VideoRequestCostFacts,
+        prepare_narrated_video_duration,
+    )
+    from server.agent_runtime.sdk_tools import enqueue_videos as mod
+
+    async def fake_prepare(**kwargs):
+        narration = NarrationDeliveryPreparation(
+            delivery=USE_TTS,
+            unit_id="E1S01",
+            speech_mode=None,
+            tts_status=NarrationTtsStatus.CURRENT,
+            artifact_path="audio/segment_E1S01.wav",
+            basis_digest="basis",
+            actual_duration_seconds=9.5,
+            problems=(),
+        )
+        return replace(
+            prepare_narrated_video_duration(
+                narration=narration,
+                planned_duration_seconds=4,
+                supported_durations=(4, 8, 12),
+                confirmed_request_duration_seconds=kwargs["confirmed_request_duration_seconds"],
+            ),
+            cost=VideoRequestCostFacts("openai", "sora-2", "720p", 12, True),
+        )
+
+    enqueue = AsyncMock()
+    monkeypatch.setattr(mod, "active_tts_resource_ids", AsyncMock(return_value=frozenset()))
+    monkeypatch.setattr(mod, "_prepare_storyboard_delivery_for_item", fake_prepare, raising=False)
+    monkeypatch.setattr(mod, "quote_video_request", AsyncMock(return_value=None))
+    monkeypatch.setattr(mod, "enqueue_and_wait", enqueue)
+
+    result = await _call(
+        generate_video_scene_tool(fake_ctx),
+        {"script": "episode_1.json", "scene_id": "E1S01", "narration_delivery": "use_tts"},
+    )
+
+    assert result["is_error"] is True
+    assert result["request_projection"]["allowed"] is False
+    assert [problem["code"] for problem in result["request_projection"]["problems"]] == [
+        "reference_duration_confirmation_required",
+        "video_request_cost_unavailable",
+    ]
+    enqueue.assert_not_awaited()
+
+
+@pytest.mark.unit
+async def test_generate_video_scene_accepts_legacy_drama_dialogue(fake_ctx: ToolContext, monkeypatch) -> None:
+    from server.agent_runtime.sdk_tools import enqueue_videos as mod
+
+    fake_ctx.pm.project_payload["content_mode"] = "drama"  # type: ignore[attr-defined]
+    fake_ctx.pm.script_payload = {  # type: ignore[attr-defined]
+        "content_mode": "drama",
+        "scenes": [
+            {
+                "scene_id": "E1S01",
+                "video_prompt": {
+                    "action": "阿离转身",
+                    "camera_motion": "Static",
+                    "ambiance_audio": "风声",
+                    "dialogue": [{"speaker": "张三", "line": "跟紧我。"}],
+                },
+                "voiceover": [],
+                "generated_assets": {"storyboard_image": "storyboards/scene_E1S01.png"},
+            }
+        ],
+    }
+
+    async def fake_enqueue(**kwargs):
+        return {"task": {}, "result": {"file_path": "videos/scene_E1S01.mp4"}}
+
+    monkeypatch.setattr(mod, "enqueue_and_wait", fake_enqueue)
+    out = await _call(generate_video_scene_tool(fake_ctx), {"script": "episode_1.json", "scene_id": "E1S01"})
+
+    assert out.get("is_error") is not True, out
+
+
+@pytest.mark.unit
+async def test_generate_video_scene_accepts_speech_free_legacy_drama(fake_ctx: ToolContext, monkeypatch) -> None:
+    from server.agent_runtime.sdk_tools import enqueue_videos as mod
+
+    fake_ctx.pm.project_payload["content_mode"] = "drama"  # type: ignore[attr-defined]
+    fake_ctx.pm.script_payload = {  # type: ignore[attr-defined]
+        "content_mode": "drama",
+        "scenes": [
+            {
+                "scene_id": "E1S01",
+                "video_prompt": {
+                    "action": "阿离转身",
+                    "camera_motion": "Static",
+                    "ambiance_audio": "风声",
+                },
+                "generated_assets": {"storyboard_image": "storyboards/scene_E1S01.png"},
+            }
+        ],
+    }
+
+    async def fake_enqueue(**kwargs):
+        return {"task": {}, "result": {"file_path": "videos/scene_E1S01.mp4"}}
+
+    monkeypatch.setattr(mod, "enqueue_and_wait", fake_enqueue)
+    out = await _call(generate_video_scene_tool(fake_ctx), {"script": "episode_1.json", "scene_id": "E1S01"})
+
+    assert out.get("is_error") is not True, out
+
+
+@pytest.mark.unit
+async def test_generate_video_scene_accepts_legacy_narration_string_prompt(fake_ctx: ToolContext, monkeypatch) -> None:
+    from server.agent_runtime.sdk_tools import enqueue_videos as mod
+
+    fake_ctx.pm.project_payload["content_mode"] = "narration"  # type: ignore[attr-defined]
+    fake_ctx.pm.script_payload = {  # type: ignore[attr-defined]
+        "content_mode": "narration",
+        "segments": [
+            {
+                "segment_id": "E1S01",
+                "novel_text": "风吹过旷野。",
+                "video_prompt": "Slow pan across the field",
+                "generated_assets": {"storyboard_image": "storyboards/scene_E1S01.png"},
+            }
+        ],
+    }
+
+    async def fake_enqueue(**kwargs):
+        return {"task": {}, "result": {"file_path": "videos/scene_E1S01.mp4"}}
+
+    monkeypatch.setattr(mod, "enqueue_and_wait", fake_enqueue)
+    out = await _call(generate_video_scene_tool(fake_ctx), {"script": "episode_1.json", "scene_id": "E1S01"})
+
+    assert out.get("is_error") is not True, out
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("case", SPEECH_CONTRACT_CASES, ids=lambda case: case.route_id)
+async def test_six_route_agent_single_video_generation_returns_structured_admission_without_enqueuing(
+    fake_ctx: ToolContext,
+    monkeypatch,
+    case: SpeechContractCase,
+) -> None:
+    from server.agent_runtime.sdk_tools import enqueue_videos as mod
+
+    fake_ctx.pm.project_payload.update(  # type: ignore[attr-defined]
+        {"content_mode": case.content_mode, "generation_mode": case.generation_mode}
+    )
+    fake_ctx.pm.script_payload = case.script()  # type: ignore[attr-defined]
+    enqueue = AsyncMock()
+    batch_enqueue = AsyncMock()
+    monkeypatch.setattr(mod, "enqueue_and_wait", enqueue)
+    monkeypatch.setattr(mod, "batch_enqueue_and_wait", batch_enqueue)
+
+    out = await _call(generate_video_scene_tool(fake_ctx), {"script": "episode_1.json", "scene_id": case.unit_id})
+
+    assert out.get("is_error") is True
+    problem = out["speech_admission"]["problems"][0]
+    assert out["speech_admission"]["unit_id"] == case.unit_id
+    assert problem["code"] == "mixed_speech"
+    assert [tuple(location["path"]) for location in problem["locations"]] == list(case.expected_locations)
+    assert problem["reason"] == "character_and_narrator_mixed"
+    assert problem["action"] == "replan_unit"
+    enqueue.assert_not_awaited()
+    batch_enqueue.assert_not_awaited()
 
 
 @pytest.mark.unit
@@ -2002,15 +2906,15 @@ def test_get_video_prompt_strips_caller_supplied_voice_profiles_for_non_drama() 
 
 
 @pytest.mark.unit
-async def test_resolve_voice_characters_skips_non_drama(fake_ctx: ToolContext) -> None:
+async def test_resolve_voice_context_skips_non_drama(fake_ctx: ToolContext) -> None:
     """narration/ad：不解析 voice_consistency，直接跳过（无 drama dialogue speaker 概念）。"""
-    from server.agent_runtime.sdk_tools.enqueue_videos import _resolve_voice_characters
+    from server.agent_runtime.sdk_tools.enqueue_videos import _resolve_voice_context
 
-    assert await _resolve_voice_characters(fake_ctx, "narration") is None
+    assert await _resolve_voice_context(fake_ctx, "narration") is None
 
 
 @pytest.mark.unit
-async def test_resolve_voice_characters_drama_reads_project_characters_and_gate(
+async def test_resolve_voice_context_drama_reads_project_characters_and_gate(
     fake_ctx: ToolContext, monkeypatch
 ) -> None:
     """drama：读项目角色资产，无声（C 类真无声、或本集关闭音频）时退回不注入。"""
@@ -2020,19 +2924,19 @@ async def test_resolve_voice_characters_drama_reads_project_characters_and_gate(
         return False
 
     monkeypatch.setattr(mod, "resolve_project_is_silent", fake_not_silent)
-    characters = await mod._resolve_voice_characters(fake_ctx, "drama")
+    characters = await mod._resolve_voice_context(fake_ctx, "drama")
     assert characters == fake_ctx.pm.project_payload["characters"]  # type: ignore[attr-defined]
 
     async def fake_silent(_project, _episode=None):
         return True
 
     monkeypatch.setattr(mod, "resolve_project_is_silent", fake_silent)
-    assert await mod._resolve_voice_characters(fake_ctx, "drama") is None
+    assert await mod._resolve_voice_context(fake_ctx, "drama") is None
 
 
 @pytest.mark.unit
 def test_build_reference_specs_routes_through_guard(tmp_path) -> None:
-    """参考生视频入队经统一守卫点：prompt 由 shots 拼接后随 payload 入队（见 ADR-0001）。"""
+    """参考生视频 prompt 只用于统一结构守卫，不冻结进任务 payload。"""
     from server.agent_runtime.sdk_tools.enqueue_videos import _build_reference_specs
 
     # production 的 shots[*].text 由 parse_prompt 产出、已剥离 "Shot N (Xs):" header，
@@ -2049,8 +2953,7 @@ def test_build_reference_specs_routes_through_guard(tmp_path) -> None:
     assert len(specs) == 1
     assert specs[0].task_type == "reference_video"
     assert specs[0].resource_id == "E1U1"
-    # 拼接出的 prompt 经守卫点校验后落入 payload。
-    assert specs[0].payload["prompt"] == "@张三 推门"
+    assert "prompt" not in specs[0].payload
     assert specs[0].payload["script_file"] == "episode_1.json"
 
 
@@ -2067,6 +2970,32 @@ def test_build_reference_specs_skips_blank_prompt(tmp_path) -> None:
     specs, order_map = _build_reference_specs(units=units, script_filename="episode_1.json", skip_ids=None, log=log)
     assert [s.resource_id for s in specs] == ["E1U2"]
     assert any("E1U1" in w for w in log)
+
+
+@pytest.mark.unit
+def test_build_reference_specs_skips_mixed_speech_without_aborting_batch(tmp_path) -> None:
+    from server.agent_runtime.sdk_tools.enqueue_videos import _build_reference_specs
+
+    units = [
+        {
+            "unit_id": "E1U1",
+            "shots": [{"text": "@[张三]：{快走。}\n{风吹过旷野。}"}],
+            "references": [],
+        },
+        {"unit_id": "E1U2", "shots": [{"text": "@李四 转身"}], "references": []},
+    ]
+    log: list[str] = []
+
+    specs, order_map = _build_reference_specs(
+        units=units,
+        script_filename="episode_1.json",
+        skip_ids=None,
+        log=log,
+    )
+
+    assert [spec.resource_id for spec in specs] == ["E1U2"]
+    assert order_map == {"E1U2": 1}
+    assert any("E1U1" in message and "mixed_speech" in message for message in log)
 
 
 @pytest.mark.unit
@@ -2242,7 +3171,7 @@ async def test_generate_episode_script_dry_run(fake_ctx: ToolContext, monkeypatc
         def __init__(self, _path):
             pass
 
-        async def build_prompt(self, _episode):
+        async def build_prompt(self, _episode, *, instructions=None):
             return "fake prompt"
 
     monkeypatch.setattr(mod, "ScriptGenerator", _FakeGenerator)
@@ -2425,7 +3354,7 @@ async def test_fetch_video_caps_narrows_durations_by_constraints(monkeypatch) ->
     _default, durations = await ctx_mod.fetch_video_caps({})
     assert durations == [4, 6, 8]
 
-    # 项目显式选了无声明的分辨率：不收窄，与改动前一致
+    # 项目显式选了无声明的分辨率时不收窄。
     project = {"model_settings": {"gemini-aistudio/veo-3.1-generate-preview": {"resolution": "720p"}}}
     _default, durations = await ctx_mod.fetch_video_caps(project)
     assert durations == [4, 6, 8]
@@ -2631,6 +3560,64 @@ async def test_normalize_drama_script_passes_project_name_to_backend(fake_ctx: T
 
 
 @pytest.mark.unit
+async def test_normalize_drama_script_marks_mixed_machine_candidate_before_review(
+    fake_ctx: ToolContext, monkeypatch
+) -> None:
+    from server.agent_runtime.sdk_tools import text_generation as mod
+
+    project_path = fake_ctx.project_path
+    source_dir = project_path / "source"
+    source_dir.mkdir(parents=True)
+    (source_dir / "chapter1.txt").write_text("从前有座山", encoding="utf-8")
+
+    async def fake_caps(_project, _episode=None):
+        return 4, [4, 6, 8]
+
+    class _FakeGenerator:
+        async def generate(self, _request, project_name=None):
+            class _Result:
+                text = json.dumps(
+                    {
+                        "title": "第一集",
+                        "scenes": [
+                            {
+                                "scene_id": "E1S01",
+                                "duration_seconds": 4,
+                                "segment_break": False,
+                                "characters_in_scene": ["阿离"],
+                                "scenes": [],
+                                "props": [],
+                                "scene_description": "阿离站在山门前。",
+                                "utterances": [
+                                    {"kind": "dialogue", "speaker": "阿离", "text": "我回来了。"},
+                                    {"kind": "voiceover", "speaker": None, "text": "三年后。"},
+                                ],
+                                "source_text": "三年后，阿离回到山门。",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+
+            return _Result()
+
+    async def fake_create(_task_type, project_name=None):
+        return _FakeGenerator()
+
+    monkeypatch.setattr(mod, "_fetch_caps_with_fallback", fake_caps)
+    monkeypatch.setattr(mod.TextGenerator, "create", fake_create)
+
+    result = await _call(normalize_drama_script_tool(fake_ctx), {"episode": 1})
+
+    assert result.get("is_error") is not True, result
+    saved = json.loads(
+        (project_path / "drafts" / "episode_1" / "step1_normalized_script.json").read_text(encoding="utf-8")
+    )
+    assert saved["scenes"][0]["needs_replan"] is True
+    assert [utterance["text"] for utterance in saved["scenes"][0]["utterances"]] == ["我回来了。", "三年后。"]
+
+
+@pytest.mark.unit
 async def test_normalize_drama_script_no_source(fake_ctx: ToolContext) -> None:
     tool_obj = normalize_drama_script_tool(fake_ctx)
     out = await _call(tool_obj, {"episode": 1})
@@ -2790,7 +3777,7 @@ async def test_plan_episodes_rejects_overlong_instructions(fake_ctx: ToolContext
     from server.agent_runtime.sdk_tools import episode_planning as mod
 
     monkeypatch.setattr(mod, "EpisodePlanner", _fake_planner_cls(PlanResult(episodes=[], cursor=None)))
-    out = await _call(mod.plan_episodes_tool(fake_ctx), {"instructions": "章" * (mod._MAX_INSTRUCTIONS_LEN + 1)})
+    out = await _call(mod.plan_episodes_tool(fake_ctx), {"instructions": "章" * (mod.MAX_INSTRUCTIONS_LEN + 1)})
 
     assert out.get("is_error") is True
     assert "过长" in out["content"][0]["text"]
@@ -2810,7 +3797,7 @@ async def test_plan_episodes_accepts_boundary_length_instructions(fake_ctx: Tool
         cursor=None,
     )
     monkeypatch.setattr(mod, "EpisodePlanner", _fake_planner_cls(result, captured))
-    text = "章" * mod._MAX_INSTRUCTIONS_LEN
+    text = "章" * mod.MAX_INSTRUCTIONS_LEN
     out = await _call(mod.plan_episodes_tool(fake_ctx), {"instructions": text})
 
     assert out.get("is_error") is not True
@@ -3045,36 +4032,24 @@ async def test_reset_episode_planning_requires_from_episode(fake_ctx: ToolContex
 
 
 # ---------------------------------------------------------------------------
-# enqueue_videos — ad + reference_video（派生分组直出）
+# enqueue_videos — ad + reference_video（统一 video_units）
 # ---------------------------------------------------------------------------
 
 
-def _ad_shot(shot_id: str, duration: int, **overrides: Any) -> dict[str, Any]:
-    base: dict[str, Any] = {
-        "shot_id": shot_id,
-        "section": "hook",
-        "duration_seconds": duration,
-        "voiceover_text": "口播",
-        "products_in_shot": [],
-        "image_prompt": {
-            "scene": f"{shot_id} 画面",
-            "composition": {"shot_type": "Close-up", "lighting": "自然光", "ambiance": "明亮"},
-        },
-        "video_prompt": {
-            "action": f"{shot_id} 动作",
-            "camera_motion": "Static",
-            "ambiance_audio": "",
-            "dialogue": [],
-        },
+def _ad_reference_unit(**overrides: Any) -> dict[str, Any]:
+    unit: dict[str, Any] = {
+        "unit_id": "E1U1",
+        "duration_seconds": 5,
+        "shots": [{"text": "镜头1：@[保温杯] 置于桌面"}],
+        "references": [{"type": "product", "name": "保温杯"}],
+        "generated_assets": {},
     }
-    base.update(overrides)
-    return base
+    unit.update(overrides)
+    return unit
 
 
 @pytest.fixture
 def ad_reference_ctx(fake_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch) -> ToolContext:
-    from contextlib import contextmanager
-
     from server.agent_runtime.sdk_tools import enqueue_videos as mod
 
     pm = fake_ctx.pm
@@ -3083,6 +4058,7 @@ def ad_reference_ctx(fake_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch) -> 
             "content_mode": "ad",
             "generation_mode": "reference_video",
             "style": "明亮写实",
+            "products": {"保温杯": {"description": "主推产品"}},
             "episodes": [{"episode": 1, "title": "短片", "script_file": "scripts/episode_1.json"}],
         }
     )
@@ -3090,171 +4066,202 @@ def ad_reference_ctx(fake_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch) -> 
         "content_mode": "ad",
         "episode": 1,
         "title": "短片",
-        "shots": [
-            _ad_shot("E1S1", 3, products_in_shot=["保温杯"]),
-            _ad_shot("E1S2", 2),
-        ],
+        "video_units": [_ad_reference_unit()],
     }
 
-    @contextmanager
-    def _locked(_name: str, _filename: str, **_kw: Any):
-        yield pm.script_payload  # type: ignore[attr-defined]
+    async def _fake_no_active_tasks(**_kwargs: Any) -> list[dict[str, Any]]:
+        return []
 
-    pm.locked_script = _locked  # type: ignore[attr-defined]
+    async def _allow_audio_switch(_project: dict[str, Any], _capability: str) -> None:
+        return None
 
-    async def _fake_max_duration(_project: dict[str, Any], _episode: int | None = None) -> int | None:
-        return 15
-
-    monkeypatch.setattr(mod, "resolve_max_unit_duration", _fake_max_duration)
+    monkeypatch.setattr(mod, "get_active_tasks_for_resources", _fake_no_active_tasks)
+    monkeypatch.setattr(mod, "assert_audio_switch_supported", _allow_audio_switch)
     return fake_ctx
 
 
-@pytest.mark.unit
-async def test_generate_video_episode_ad_reference_derives_and_enqueues(
-    ad_reference_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """ad + reference_video：自动派生分组、持久化索引、按 unit 入队 reference_video 任务。"""
-    from server.agent_runtime.sdk_tools import enqueue_videos as mod
-
-    enqueued: list[Any] = []
-
+def _successful_reference_batch(ctx: ToolContext, enqueued: list[Any]):
     async def fake_batch(*, project_name: str, specs: list[Any], on_success=None, on_failure=None):
         from lib.generation_queue_client import BatchTaskResult
 
+        successes: list[BatchTaskResult] = []
         for spec in specs:
             enqueued.append(spec)
-            out = ad_reference_ctx.project_path / "reference_videos" / f"{spec.resource_id}.mp4"
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_bytes(b"\x00")
-            br = BatchTaskResult(
+            output = ctx.project_path / "reference_videos" / f"{spec.resource_id}.mp4"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"\x00")
+            result = BatchTaskResult(
                 resource_id=spec.resource_id,
                 task_id="t1",
                 status="succeeded",
                 result={"file_path": f"reference_videos/{spec.resource_id}.mp4"},
             )
+            successes.append(result)
             if on_success:
-                on_success(br)
-        return [], []
+                on_success(result)
+        return successes, []
 
-    monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
+    return fake_batch
 
-    tool_obj = generate_video_episode_tool(ad_reference_ctx)
-    out = await _call(tool_obj, {"script": "episode_1.json"})
+
+@pytest.mark.integration
+async def test_generate_video_episode_reference_skips_malformed_unit_entries(
+    ad_reference_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """脏 unit 元素交给逐条校验跳过，不在完成扫描、音频闸门或时长预检中断整批。"""
+    from server.agent_runtime.sdk_tools import enqueue_videos as mod
+
+    valid = ad_reference_ctx.pm.script_payload["video_units"][0]  # type: ignore[attr-defined]
+    ad_reference_ctx.pm.script_payload["video_units"] = ["bad", {}, valid]  # type: ignore[attr-defined]
+    enqueued: list[Any] = []
+    monkeypatch.setattr(mod, "batch_enqueue_and_wait", _successful_reference_batch(ad_reference_ctx, enqueued))
+
+    out = await _call(
+        generate_video_episode_tool(ad_reference_ctx),
+        {"script": "episode_1.json"},
+    )
 
     assert out.get("is_error") is not True, out
-    assert [s.resource_id for s in enqueued] == ["E1U1"]
-    assert enqueued[0].task_type == "reference_video"
-    # 派生索引持久化进剧本
+    assert [spec.resource_id for spec in enqueued] == ["E1U1"]
+    assert "入队校验未通过" in out["content"][0]["text"]
+
+
+@pytest.mark.integration
+async def test_generate_video_episode_ad_reference_enqueues_existing_video_units(
+    ad_reference_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """广告参考路线直接消费自包含 video_units，不派生或写入 reference_units。"""
+    from server.agent_runtime.sdk_tools import enqueue_videos as mod
+
+    enqueued: list[Any] = []
+    monkeypatch.setattr(mod, "batch_enqueue_and_wait", _successful_reference_batch(ad_reference_ctx, enqueued))
+
+    out = await _call(
+        generate_video_episode_tool(ad_reference_ctx),
+        {"script": "episode_1.json"},
+    )
+
+    assert out.get("is_error") is not True, out
+    assert [spec.resource_id for spec in enqueued] == ["E1U1"]
     script = ad_reference_ctx.pm.script_payload  # type: ignore[attr-defined]
-    assert script["reference_units"][0]["shot_ids"] == ["E1S1", "E1S2"]
-    assert script["reference_units"][0]["references"][0] == {"type": "product", "name": "保温杯"}
+    assert [unit["unit_id"] for unit in script["video_units"]] == ["E1U1"]
+    assert "reference_units" not in script
+
+
+@pytest.mark.integration
+async def test_generate_video_episode_ad_reference_does_not_claim_orphan_file(
+    ad_reference_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同名文件没有 generated_assets 归属时仍须入队，不能把孤儿文件报告为成功。"""
+    from server.agent_runtime.sdk_tools import enqueue_videos as mod
+
+    orphan = ad_reference_ctx.project_path / "reference_videos/E1U1.mp4"
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_bytes(b"orphan")
+    enqueued: list[Any] = []
+    monkeypatch.setattr(mod, "batch_enqueue_and_wait", _successful_reference_batch(ad_reference_ctx, enqueued))
+
+    out = await _call(
+        generate_video_episode_tool(ad_reference_ctx),
+        {"script": "episode_1.json"},
+    )
+
+    assert out.get("is_error") is not True, out
+    assert [spec.resource_id for spec in enqueued] == ["E1U1"]
 
 
 @pytest.mark.unit
-async def test_generate_video_episode_ad_reference_keeps_stale_unit_and_reports(
+async def test_generate_video_episode_ad_reference_replan_shell_cannot_enqueue(
     ad_reference_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """成员/参考集偏离产物的 unit 保留成片指针并按现有产物跳过，stale 清单透出到工具输出。"""
+    """迁移保留的 needs_replan 空壳可被读取，但不能提交生成任务。"""
     from server.agent_runtime.sdk_tools import enqueue_videos as mod
 
-    pm = ad_reference_ctx.pm
-    # 旧索引：E1U1 仅含 E1S1 且已完成；当前 shots 派生出的 E1U1 含 E1S1+E1S2 → 打 stale 位
-    pm.script_payload["reference_units"] = [  # type: ignore[attr-defined]
-        {
-            "unit_id": "E1U1",
-            "shot_ids": ["E1S1"],
-            "references": [{"type": "product", "name": "保温杯"}],
-            "generated_assets": {"video_clip": "reference_videos/E1U1.mp4", "status": "completed"},
-        }
+    ad_reference_ctx.pm.script_payload["video_units"] = [  # type: ignore[attr-defined]
+        _ad_reference_unit(
+            shots=[],
+            references=[],
+            duration_seconds=0,
+            needs_replan=True,
+            generated_assets={"source_signature": "legacy"},
+        )
     ]
-    existing = ad_reference_ctx.project_path / "reference_videos" / "E1U1.mp4"
-    existing.parent.mkdir(parents=True, exist_ok=True)
-    existing.write_bytes(b"\x00")
+    called = False
+
+    async def _fail_if_enqueued(*args: Any, **kwargs: Any):
+        nonlocal called
+        called = True
+        raise AssertionError("needs_replan shell must not enqueue")
+
+    monkeypatch.setattr(mod, "batch_enqueue_and_wait", _fail_if_enqueued)
+
+    out = await _call(
+        generate_video_episode_tool(ad_reference_ctx),
+        {"script": "episode_1.json"},
+    )
+
+    assert out.get("is_error") is True
+    assert out["speech_admission"]["allowed"] is False
+    assert out["speech_admission"]["unit_id"] == "E1U1"
+    assert out["speech_admission"]["problems"][0]["code"] == "needs_replan"
+    assert out["speech_admission"]["problems"][0]["action"] == "replan_unit"
+    assert "E1U1" in out["content"][0]["text"]
+    assert not called
+
+
+@pytest.mark.unit
+async def test_generate_video_episode_ad_reference_replan_unit_cannot_reuse_owned_clip(
+    ad_reference_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """迁移保留的已归属视频不能绕过 needs_replan 生成闸门。"""
+    from server.agent_runtime.sdk_tools import enqueue_videos as mod
+
+    ad_reference_ctx.pm.script_payload["video_units"] = [  # type: ignore[attr-defined]
+        _ad_reference_unit(
+            needs_replan=True,
+            migration_requires_content_replan=True,
+            generated_assets={"video_clip": "reference_videos/E1U1.mp4"},
+        )
+    ]
+    owned = ad_reference_ctx.project_path / "reference_videos/E1U1.mp4"
+    owned.parent.mkdir(parents=True, exist_ok=True)
+    owned.write_bytes(b"legacy")
+    called = False
+
+    async def _fail_if_enqueued(*args: Any, **kwargs: Any):
+        nonlocal called
+        called = True
+        raise AssertionError("needs_replan unit must not enqueue")
+
+    monkeypatch.setattr(mod, "batch_enqueue_and_wait", _fail_if_enqueued)
+
+    out = await _call(
+        generate_video_episode_tool(ad_reference_ctx),
+        {"script": "episode_1.json"},
+    )
+
+    assert out.get("is_error") is True
+    assert "E1U1" in out["content"][0]["text"]
+    assert not called
+
+
+@pytest.mark.integration
+async def test_generate_video_selected_ad_reference_regenerates_named_unit(
+    ad_reference_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """广告点名重做沿用统一 video_unit 路径。"""
+    from server.agent_runtime.sdk_tools import enqueue_videos as mod
 
     enqueued: list[Any] = []
+    monkeypatch.setattr(mod, "batch_enqueue_and_wait", _successful_reference_batch(ad_reference_ctx, enqueued))
 
-    async def fake_batch(*, project_name: str, specs: list[Any], on_success=None, on_failure=None):
-        enqueued.extend(specs)
-        return [], []
-
-    monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
-
-    tool_obj = generate_video_episode_tool(ad_reference_ctx)
-    out = await _call(tool_obj, {"script": "episode_1.json"})
+    out = await _call(
+        generate_video_selected_tool(ad_reference_ctx),
+        {"script": "episode_1.json", "scene_ids": ["E1U1"]},
+    )
 
     assert out.get("is_error") is not True, out
-    # 剧本变更不作废产物：既有成片按现行产物复用，不自动重生成
-    assert enqueued == []
-    script = pm.script_payload  # type: ignore[attr-defined]
-    assert script["reference_units"][0]["generated_assets"]["video_clip"] == "reference_videos/E1U1.mp4"
-    assert script["reference_units"][0]["stale"] is True
-    text = out["content"][0]["text"]
-    assert "stale" in text
-    assert "E1U1" in text
-
-
-@pytest.mark.unit
-async def test_generate_video_episode_ad_reference_skips_unchanged_unit_with_output(
-    ad_reference_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """成员与参考集未变且产物在盘的 unit 按已完成跳过，不重复入队。"""
-    from server.agent_runtime.sdk_tools import enqueue_videos as mod
-
-    pm = ad_reference_ctx.pm
-    pm.script_payload["reference_units"] = [  # type: ignore[attr-defined]
-        {
-            "unit_id": "E1U1",
-            "shot_ids": ["E1S1", "E1S2"],
-            "references": [{"type": "product", "name": "保温杯"}],
-            "generated_assets": {"video_clip": "reference_videos/E1U1.mp4", "status": "completed"},
-        }
-    ]
-    done = ad_reference_ctx.project_path / "reference_videos" / "E1U1.mp4"
-    done.parent.mkdir(parents=True, exist_ok=True)
-    done.write_bytes(b"\x00")
-
-    enqueued: list[Any] = []
-
-    async def fake_batch(*, project_name: str, specs: list[Any], on_success=None, on_failure=None):
-        enqueued.extend(specs)
-        return [], []
-
-    monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
-
-    tool_obj = generate_video_episode_tool(ad_reference_ctx)
-    out = await _call(tool_obj, {"script": "episode_1.json"})
-
-    assert out.get("is_error") is not True, out
-    assert enqueued == []
-
-
-@pytest.mark.unit
-async def test_generate_video_all_ad_reference_falls_through_to_episode(
-    ad_reference_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from server.agent_runtime.sdk_tools import enqueue_videos as mod
-
-    async def fake_batch(*, project_name: str, specs: list[Any], on_success=None, on_failure=None):
-        from lib.generation_queue_client import BatchTaskResult
-
-        for spec in specs:
-            if on_success:
-                on_success(
-                    BatchTaskResult(
-                        resource_id=spec.resource_id,
-                        task_id="t1",
-                        status="succeeded",
-                        result={"file_path": f"reference_videos/{spec.resource_id}.mp4"},
-                    )
-                )
-        return [], []
-
-    monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
-
-    tool_obj = generate_video_all_tool(ad_reference_ctx)
-    out = await _call(tool_obj, {"script": "episode_1.json"})
-
-    assert out.get("is_error") is not True, out
+    assert [spec.resource_id for spec in enqueued] == ["E1U1"]
 
 
 # ---------------------------------------------------------------------------
@@ -4661,6 +5668,134 @@ async def test_split_narration_segments_dry_run(fake_ctx: ToolContext, monkeypat
     assert "E1S" in prompt_text
     assert "张三" in prompt_text
     assert "4" in prompt_text
+    # 未传 instructions 时无用户意见分节
+    assert "# 用户意见" not in prompt_text
+
+
+@pytest.mark.unit
+async def test_split_narration_segments_injects_instructions(fake_ctx: ToolContext, monkeypatch) -> None:
+    """instructions 原样进 prompt 末尾的中性「用户意见」分节，不附加强度措辞。"""
+    from server.agent_runtime.sdk_tools import text_generation as mod
+
+    _rv_source(fake_ctx)
+    monkeypatch.setattr(mod, "_fetch_caps_with_fallback", _nr_caps())
+
+    tool_obj = split_narration_segments_tool(fake_ctx)
+    out = await _call(tool_obj, {"episode": 1, "dry_run": True, "instructions": "单个片段出场人物尽量不超过两人"})
+    assert out.get("is_error") is not True, out
+    prompt_text = out["content"][0]["text"]
+    assert "# 用户意见" in prompt_text
+    assert "单个片段出场人物尽量不超过两人" in prompt_text
+    assert "必须全部落实" not in prompt_text
+
+
+@pytest.mark.unit
+async def test_split_narration_segments_rejects_bad_instructions(fake_ctx: ToolContext, monkeypatch) -> None:
+    """instructions 超长 / 非字符串按参数错误拒绝；空白 strip 后视同未传（校验为四个生成工具共享）。"""
+    from server.agent_runtime.sdk_tools import text_generation as mod
+
+    _rv_source(fake_ctx)
+    monkeypatch.setattr(mod, "_fetch_caps_with_fallback", _nr_caps())
+    tool_obj = split_narration_segments_tool(fake_ctx)
+
+    out = await _call(tool_obj, {"episode": 1, "dry_run": True, "instructions": "长" * 4001})
+    assert out.get("is_error") is True
+    assert "4000" in out["content"][0]["text"]
+
+    out = await _call(tool_obj, {"episode": 1, "dry_run": True, "instructions": 42})
+    assert out.get("is_error") is True
+
+    out = await _call(tool_obj, {"episode": 1, "dry_run": True, "instructions": "   \n  "})
+    assert out.get("is_error") is not True, out
+    assert "# 用户意见" not in out["content"][0]["text"]
+
+
+@pytest.mark.unit
+async def test_normalize_drama_script_injects_instructions(fake_ctx: ToolContext, monkeypatch) -> None:
+    from server.agent_runtime.sdk_tools import text_generation as mod
+
+    project_path = fake_ctx.project_path
+    src = project_path / "source"
+    src.mkdir(parents=True)
+    (src / "chapter1.txt").write_text("从前有座山", encoding="utf-8")
+
+    async def fake_caps(_p, _episode=None):
+        return 4, [4, 6, 8]
+
+    monkeypatch.setattr(mod, "_fetch_caps_with_fallback", fake_caps)
+    tool_obj = normalize_drama_script_tool(fake_ctx)
+    out = await _call(tool_obj, {"episode": 1, "dry_run": True, "instructions": "打斗场面多拆几个短镜头"})
+    assert out.get("is_error") is not True, out
+    prompt_text = out["content"][0]["text"]
+    assert "# 用户意见" in prompt_text
+    assert "打斗场面多拆几个短镜头" in prompt_text
+
+
+@pytest.mark.unit
+async def test_split_reference_video_units_injects_instructions(fake_ctx: ToolContext, monkeypatch) -> None:
+    from server.agent_runtime.sdk_tools import text_generation as mod
+
+    _rv_source(fake_ctx)
+    monkeypatch.setattr(mod, "_fetch_reference_caps_with_fallback", fake_reference_caps_fetcher())
+
+    tool_obj = split_reference_video_units_tool(fake_ctx)
+    out = await _call(tool_obj, {"episode": 1, "dry_run": True, "instructions": "单 unit 出场人物尽量不超过两人"})
+    assert out.get("is_error") is not True, out
+    prompt_text = out["content"][0]["text"]
+    assert "# 用户意见" in prompt_text
+    assert "单 unit 出场人物尽量不超过两人" in prompt_text
+
+
+@pytest.mark.unit
+async def test_generate_episode_script_forwards_instructions(fake_ctx: ToolContext, monkeypatch) -> None:
+    """handler 把 instructions 原样转交 ScriptGenerator（dry_run 与生成路径同口径）。"""
+    from lib import script_review
+    from server.agent_runtime.sdk_tools import text_generation as mod
+
+    project_path = fake_ctx.project_path
+    drafts = project_path / "drafts" / "episode_1"
+    drafts.mkdir(parents=True)
+    step1 = drafts / "step1_segments.json"
+    step1.write_text("step1", encoding="utf-8")
+    fingerprint = script_review.content_fingerprint(step1)
+    (project_path / "project.json").write_text(
+        json.dumps(
+            {
+                "content_mode": "narration",
+                "episodes": [{"episode": 1, "step1_review": {"fingerprint": fingerprint, "confirmed_at": "t"}}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _FakeGenerator:
+        def __init__(self, _path):
+            pass
+
+        @classmethod
+        async def create(cls, _path):
+            return cls(_path)
+
+        async def build_prompt(self, _episode, *, instructions=None):
+            captured["build_prompt"] = instructions
+            return "fake prompt"
+
+        async def generate(self, *, episode, instructions=None):
+            captured["generate"] = instructions
+            return project_path / "scripts" / "episode_1.json"
+
+    monkeypatch.setattr(mod, "ScriptGenerator", _FakeGenerator)
+    tool_obj = generate_episode_script_tool(fake_ctx)
+
+    out = await _call(tool_obj, {"episode": 1, "dry_run": True, "instructions": "偏好特写镜头"})
+    assert out.get("is_error") is not True, out
+    assert captured["build_prompt"] == "偏好特写镜头"
+
+    out = await _call(tool_obj, {"episode": 1, "instructions": "偏好特写镜头"})
+    assert out.get("is_error") is not True, out
+    assert captured["generate"] == "偏好特写镜头"
 
 
 @pytest.mark.unit

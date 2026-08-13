@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# classify_commits.sh — emit metadata for each PR commit so Claude can judge "nit-only vs feature".
+# classify_commits.sh — emit metadata for each PR commit so the orchestrating agent can judge "nit-only vs feature".
 #
 # USAGE
-#   bash classify_commits.sh <PR_NUMBER> [SINCE_SHA]
+#   bash classify_commits.sh --repo-root <path> <PR_NUMBER> [SINCE_SHA]
 #
 # If SINCE_SHA omitted, returns all commits on the PR. With SINCE_SHA, returns commits AFTER that SHA
 # (use to inspect just the latest push: pass the previous round's head).
+#
+# A SINCE_SHA that is not on the PR's commit list (typical cause: a rebase rewrote every SHA)
+# returns ALL commits and warns on stderr — re-anchor on the current commit list instead of
+# trusting the stale SHA.
 #
 # OUTPUT: JSON array, one object per commit:
 # [
@@ -27,14 +31,20 @@
 #   (a) skip burning Gemini quota on a manual re-trigger (the conservative-trigger gate), and
 #   (b) judge whether a round produced substantive value — user-facing behaviour or lower cost of
 #       future change — for the convergence exit. Metadata only; read the diff by SHA when unclear.
-# Output is raw metadata (file count, line stats, message text); Claude makes the final call —
+# Output is raw metadata (file count, line stats, message text); the orchestrating agent makes the final call —
 # scripting "is this nit?" would miss semantic cues like "fix typo in error message
 # (1 line, 1 file)" being clearly nit vs "fix race in lock release (1 line, 1 file)" being NOT nit.
 
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/repo-context.sh"
+enter_repo_root "POLL_ERROR" "$@"
+shift "$REPO_CONTEXT_SHIFT"
+
 if [[ $# -lt 1 ]]; then
-  echo "POLL_ERROR: missing PR_NUMBER. Usage: bash classify_commits.sh <PR_NUMBER> [SINCE_SHA]" >&2
+  echo "POLL_ERROR: missing PR_NUMBER. Usage: bash classify_commits.sh [--repo-root <path>] <PR_NUMBER> [SINCE_SHA]" >&2
   exit 2
 fi
 
@@ -57,6 +67,9 @@ COMMITS_JSON=$(gh pr view "$PR" --json commits 2>/dev/null) || {
 
 # Filter to commits after SINCE_SHA if provided.
 if [[ -n "$SINCE_SHA" ]]; then
+  if [[ $(echo "$COMMITS_JSON" | jq --arg since "$SINCE_SHA" '.commits | map(.oid) | index($since)') == "null" ]]; then
+    echo "WARNING: SINCE_SHA $SINCE_SHA is not on PR $PR (branch rebased?). Returning ALL commits — re-anchor on the current commit list." >&2
+  fi
   FILTERED=$(echo "$COMMITS_JSON" | jq --arg since "$SINCE_SHA" '
     .commits as $all
     | ($all | map(.oid) | index($since)) as $idx

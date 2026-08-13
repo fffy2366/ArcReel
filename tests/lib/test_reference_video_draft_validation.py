@@ -6,6 +6,7 @@ import pytest
 
 from lib.reference_video.draft_validation import (
     DraftViolation,
+    DraftViolations,
     assert_dialogue_preserved,
     dialogue_speakers,
     normative_lines,
@@ -13,6 +14,7 @@ from lib.reference_video.draft_validation import (
     validate_source_text_anchor,
     validate_unit_text,
 )
+from lib.reference_video.quarantine import violation_entries
 
 pytestmark = pytest.mark.unit
 
@@ -51,6 +53,35 @@ class TestSourceTextAnchor:
 
 
 class TestUnitText:
+    def test_mixed_speech_is_a_structured_planning_violation(self):
+        with pytest.raises(DraftViolations) as exc_info:
+            validate_unit_text(
+                "unit E1U01",
+                "镜头1：门被推开\n@[李明]：{快走。}\n{风吹过旷野。}",
+                PROJECT,
+                max_refs=None,
+            )
+
+        problem = exc_info.value.items[0]
+        assert problem.code == "mixed_speech"
+        assert problem.label == "unit E1U01"
+        assert violation_entries([problem]) == [
+            {
+                "code": "mixed_speech",
+                "label": "unit E1U01",
+                "message": str(problem),
+                "line": None,
+                "locations": [
+                    {"path": ["shots", 0, "text"], "line": 1},
+                    {"path": ["shots", 0, "text"], "line": 2},
+                ],
+                "reason": "character_and_narrator_mixed",
+                "action": "replan_unit",
+            }
+        ]
+        assert "character_and_narrator_mixed" in str(problem)
+        assert "replan_unit" in str(problem)
+
     def test_derives_shots_and_references(self):
         shots, refs = validate_unit_text(
             "unit E1U01",
@@ -201,6 +232,13 @@ class TestDialogueLoad:
         long_line = "画外音很长很长的一段" * 6
         with pytest.raises(DraftViolation, match="超过该 unit"):
             validate_dialogue_load("unit E1U01", f"镜头1：空镜\n{{{long_line}}}", 4, "zh")
+
+    def test_project_override_changes_budget(self):
+        """项目级语速覆盖生效：同一段台词在慢速覆盖下判超载、在快速覆盖下放行。"""
+        text = "镜头1：门开了\n@[李明]：{一二三四五六七八九十一二三四五六七八九十。}"
+        with pytest.raises(DraftViolation, match="超过该 unit"):
+            validate_dialogue_load("unit E1U01", text, 4, "zh", 2.0)
+        validate_dialogue_load("unit E1U01", text, 4, "zh", 10.0)
 
     def test_non_string_language_falls_back_to_default_rate(self):
         """project.json 的 source_language 可能是脏数据：估算按默认语速走，不抛 AttributeError。"""

@@ -20,7 +20,7 @@ uv run uvicorn server.app:app --reload --reload-dir server --reload-dir lib --po
 uv run python -m pytest                              # 测试（-v 单文件 / -k 关键字 / --cov 覆盖率）
 uv run ruff check . && uv run ruff format .          # lint + format
 uv run basedpyright                                  # 类型检查（CI 强制 0 error）
-uv run lint-imports                                  # import 分层契约（CI backend-tests 必过）
+uv run lint-imports                                  # import 分层契约（CI backend-static 必过）
 uv sync                                              # 安装依赖
 uv run alembic upgrade head                          # 数据库迁移
 uv run alembic revision --autogenerate -m "desc"     # 生成迁移
@@ -75,7 +75,9 @@ pnpm build       # 生产构建，含 typecheck
 
 ### 供应商能力数据
 
-生成模型供应商的能力数据按字段划分真相源：视频能力位与各类上限归对应 backend（`VideoCapabilities`，与请求构造同源，见 `docs/adr/0054`）；图片能力位归 `PROVIDER_REGISTRY` 的 `ModelInfo.capabilities`（自定义供应商归 endpoint 声明）；其余能力数字与默认 model 归 `PROVIDER_REGISTRY`，`supported_durations` 未登记即 fail loud、无隐性 fallback（见 `docs/adr/0018`；仅时长联动约束在未登记型号上有 backend 兜底常量），自定义模型改读 DB 声明。自定义供应商（`custom-` 前缀）与智能体供应商预设的其余字段（不含图片能力位）不适用上述按 `PROVIDER_REGISTRY` 划分的真相源。prompt 模板与智能体运行配置（`agent_runtime_profile/`）不硬编码具体数值，占位符由编排层注入（供应商 API 文档镜像保留原始数值）；配置界面此类字段不预填。陷阱：个别 backend（如 vidu 的执行期分辨率白名单）独立于 registry，改 registry 分辨率声明时须同步核对对应 backend，否则用户可选但 backend 不认的档位会被静默替换为兜底档位。
+生成模型供应商的能力数据按字段划分真相源：视频能力位与各类上限归对应 backend（`VideoCapabilities`，与请求构造同源，见 `docs/adr/0054`）；图片能力位归 `PROVIDER_REGISTRY` 的 `ModelInfo.capabilities`（自定义供应商归 endpoint 声明）；视频音轨的两位描述（开关可控性、恒有声）不属于上述归 backend 的视频能力位，按型号声明在 `ModelInfo` 上；其余能力数字与默认 model 归 `PROVIDER_REGISTRY`，`supported_durations` 在 registry/backend 能力校验中未登记即 fail loud、无隐性 fallback（见 `docs/adr/0018`；仅时长联动约束在未登记型号上有 backend 兜底常量）；agent prompt 生成在能力查询失败时保留 `DEFAULT_FALLBACK` 的 best-effort 档位，该降级只保证 prompt 可用，不代表供应商运行时能力。自定义模型改读 DB 声明。自定义供应商（`custom-` 前缀）与智能体供应商预设的其余字段（不含图片能力位）不适用上述按 `PROVIDER_REGISTRY` 划分的真相源。prompt 模板与智能体运行配置（`agent_runtime_profile/`）不硬编码具体数值，占位符由编排层注入；配置界面此类字段不预填。陷阱：个别 backend（如 vidu 的执行期分辨率白名单）独立于 registry，改 registry 分辨率声明时须同步核对对应 backend，否则用户可选但 backend 不认的档位会被静默替换为兜底档位。
+
+修改 provider、endpoint、供应商 API 契约、能力、参数约束或计费时，先读 `docs/api-docs/AGENTS.md`，并同步对应官方文档索引。
 
 ### 内容模式 (content_mode) 与生成模式 (generation_mode)
 
@@ -138,8 +140,8 @@ API Key、后端选择、模型配置等通过 WebUI 配置页（`/settings`）�
 
 - **ruff**：line-length 120，提交前对修改的 Python 文件执行 `uv run ruff check <files> && uv run ruff format <files>`
 - **basedpyright**：standard 模式 + `reportMissingTypeStubs = false`，CI 强制 0 error，pre-push hook 跑全量扫描；本地可随时执行 `uv run basedpyright` 校验。tests/ 内 `reportOptional*` 和 `unknown*` 系列降级为 warning，避免大量使用 mock 的测试产生噪声；第三方 untyped 库（ffmpeg-python、pyJianYingDraft、volcenginesdkarkruntime、xai_sdk.chat、docx2txt/mammoth/ebooklib）通过行级 `# pyright: ignore[...]` 处理
-- **import-linter**：`uv run lint-imports` 校验 `lib.config < lib.*_backends < lib.custom_provider` 分层契约，CI backend-tests 必过步骤；新增 ignore 条目前先确认该依赖边无法就地清零（约定见 pyproject.toml）
-- **pytest**：`asyncio_mode = "auto"`，CI 覆盖率 ≥80%，共用 fixtures 在 `tests/conftest.py`。测试替身优先复用/扩展 `tests/fakes.py`，新建 fake 入该模块；触碰含文件内私有 fake 的测试文件时顺带迁移
+- **import-linter**：`uv run lint-imports` 校验 `lib.config < lib.*_backends < lib.custom_provider` 分层契约，CI backend-static 必过步骤；新增 ignore 条目前先确认该依赖边无法就地清零（约定见 pyproject.toml）
+- **pytest**：`asyncio_mode = "auto"`，CI 覆盖率 ≥80%，共用 fixtures 在 `tests/conftest.py`，跨文件共用的测试替身在 `tests/fakes.py`（收录边界见其模块 docstring）
 - **依赖管理**：前后端新增/升级依赖一律用 `uv add` / `pnpm add`（不手写版本号到 pyproject.toml / package.json）；新增依赖后同步 `.github/dependabot.yml` 的 patterns 归入对应分组
 - **注释**：代码与测试注释只描述当下行为与约束，不写 issue/PR/Spec 编号，也不用时间性措辞（「最近」「本次」「实测」）——这些信息写在 commit message / PR 描述；修改文件时顺带清除已有的此类引用。`docs/` 下专门文档之间互引 spec 不受此限
 - **提交与 PR**：标题遵循 Conventional Commits（`type(scope): 摘要`，type 取值与 changelog 分类见 `CONTRIBUTING.md` / `.release-please-config.json`）。squash 合并下标题即 changelog 条目——写用户可感知的收益、范围词用产品术语，不写实现术语（status_code、内部类名等）且如实限定范围。前后端同仓一体发布，后端 API 不做版本化对外承诺（外部集成经 `/skill.md` 运行时拉取契约，删改 `public/skill.md.template` 引用的端点时同步更新该模板）：接口删改按 `fix`/`refactor` 正常分类，不加 `!` 后缀、不写 `BREAKING CHANGE:` footer

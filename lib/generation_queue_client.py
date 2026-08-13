@@ -203,6 +203,28 @@ async def enqueue_task_only(
     return enqueue_result
 
 
+async def get_active_tasks_for_resources(
+    *,
+    project_name: str,
+    task_type: str,
+    resource_ids: list[str],
+    script_file: str | None = None,
+) -> list[dict[str, Any]]:
+    """查询命中入队去重键、当前处于活动态（queued/running/cancelling）的任务。
+
+    match 条件与 ``GenerationQueue.enqueue_task`` 的唯一索引去重口径一致（``resource_type``
+    固定 None——调用方均非 image_edit 任务，不占用该维度）。供调用方在真正入队前探测冲突并
+    拒绝，不消费也不影响任务本身的去重状态。
+    """
+    queue = get_generation_queue()
+    return await queue.get_active_tasks_for_resources(
+        project_name=project_name,
+        task_type=task_type,
+        resource_ids=resource_ids,
+        script_file=script_file,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Sync wrappers for skill scripts running outside an event loop
 # ---------------------------------------------------------------------------
@@ -331,8 +353,8 @@ class TaskSpec:
 
     Construct via :meth:`from_request`, the single guard point that owns a request's
     structural validity. Validation is provider-agnostic (no provider fields here):
-    capability checks such as ``duration ↔ supported_durations`` live at the execution
-    layer, after provider resolution (see ADR-0001).
+    capability checks such as ``duration ↔ supported_durations`` live in each route's
+    provider-aware request projection and are rechecked when execution materializes the request.
     """
 
     task_type: str
@@ -382,7 +404,10 @@ class TaskSpec:
             raise ValueError(f"extra_payload contains reserved keys: {', '.join(sorted(conflict))}")
 
         payload: dict[str, Any] = dict(extra_payload) if extra_payload else {}
-        payload["prompt"] = prompt
+        # reference_video 的 prompt 是可变剧本内容：这里只用当前文本做结构守卫，任务仅保存
+        # unit 定位与请求选项，worker 开始时按 script_file + resource_id 重读最新 shots。
+        if task_type != "reference_video":
+            payload["prompt"] = prompt
         if script_file is not None:
             payload["script_file"] = script_file
 

@@ -20,14 +20,16 @@ from lib.project_manager import get_project_manager
 from lib.resource_paths import resource_relative_path
 from lib.script_editor import ScriptEditError
 from lib.version_manager import VersionManager
+from server.services.grid_access import ensure_grid_writable
 from server.services.reference_video_tasks import apply_unit_video_assets
 
 router = APIRouter()
 
-# 经此路由可还原的资源类型（API 面策略）。路径形状委托 lib.resource_paths，但本路由
-# 仅放行有还原后元数据同步分支的这几类；grids 的还原是独立议题。
+# 经此路由可还原的资源类型（API 面策略）。路径形状委托 lib.resource_paths，本路由
+# 仅放行有还原后元数据同步分支的这几类。grids 的还原只换回联合图文件并复位宫格记录的
+# 切分态，不触发切分、不碰任何分镜图——落格由宫格切分端点显式执行。
 _RESTORABLE_RESOURCE_TYPES = frozenset(
-    {"storyboards", "videos", "characters", "scenes", "props", "products", "reference_videos"}
+    {"storyboards", "videos", "characters", "scenes", "props", "products", "reference_videos", "grids"}
 )
 
 
@@ -138,15 +140,44 @@ def _sync_reference_video_metadata(
 
     ``generated_at`` 传被还原版本的入库时间：还原回来的是旧内容，其 video_generated_at
     应当是那一版的生成时间，否则「早于当前参考音频设置」的存量片段会被还原动作洗成最新。
+
     """
 
     def _apply(script_name: str) -> None:
         # 资产回写热路径：只动 unit.generated_assets，豁免结构校验（与 update_scene_asset 对齐）。
         # 该集脚本不含此 unit 时 apply_unit_video_assets 抛 KeyError，锁内冒出即跳过写回。
         with get_project_manager().locked_script(project_name, script_name, validate=False) as script:
-            apply_unit_video_assets(script, resource_id, video_uri=None, thumb_rel=None, generated_at=generated_at)
+            apply_unit_video_assets(
+                script,
+                resource_id,
+                video_uri=None,
+                thumb_rel=None,
+                generated_at=generated_at,
+            )
 
     _sync_scripts_best_effort(project_path, _apply)
+
+
+def _sync_grid_record(project_path: Path, resource_id: str) -> None:
+    """还原联合图后复位宫格记录：内容已换回历史版本，旧的落格结果不再对应当前图。
+
+    只动宫格记录自身（split_at / 失败态），不同步剧本或分镜——落格由切分端点显式执行；
+    frame_chain 原样保留。记录缺失/损坏时跳过：联合图文件已还原成功，记录属 best-effort。
+
+    还原本身不设在途闸门（与分镜图还原同口径），复位口径见
+    ``GridGeneration.mark_composite_replaced``：生成在途时保留在途态，否则记录会谎报空闲。
+    """
+    from lib.grid_manager import GridManager
+
+    manager = GridManager(project_path)
+    try:
+        grid = manager.get(resource_id)
+    except Exception:
+        grid = None
+    if grid is None:
+        return
+    grid.mark_composite_replaced()
+    manager.save(grid)
 
 
 # resource_type（复数，URL 段）→ asset_type（单数，ASSET_SPECS 键）
@@ -168,7 +199,7 @@ def _sync_metadata(
 ) -> None:
     """还原后同步元数据，确保引用指向统一文件路径。
 
-    ``restored_created_at`` 为被还原版本的入库时间，仅参考视频写回时间戳时需要。
+    ``restored_created_at`` 为被还原版本的入库时间，仅参考视频写回时需要。
     """
     asset_type = _RESOURCE_TO_ASSET_TYPE.get(resource_type)
     if asset_type is not None:
@@ -183,6 +214,8 @@ def _sync_metadata(
         _sync_video_metadata(project_name, resource_id, file_path, project_path)
     elif resource_type == "reference_videos":
         _sync_reference_video_metadata(project_name, resource_id, project_path, restored_created_at)
+    elif resource_type == "grids":
+        _sync_grid_record(project_path, resource_id)
 
 
 # ==================== 版本查询 ====================
@@ -241,6 +274,11 @@ async def restore_version(
     try:
 
         def _sync():
+            # 还原同样是一条联合图写入路径（换回历史联合图 + 复位宫格记录），
+            # 与重生成/切分/上传共用准入判定；漏掉这里，被封禁项目就能从还原绕过。
+            if resource_type == "grids":
+                ensure_grid_writable(get_project_manager().load_project(project_name))
+
             vm = get_version_manager(project_name)
             project_path = get_project_manager().get_project_path(project_name)
             current_file, file_path = _resolve_resource_path(resource_type, resource_id, project_path)
@@ -252,13 +290,20 @@ async def restore_version(
                 current_file=current_file,
             )
 
-            # 还原参考视频时把该版本的原始入库时间一并写回，避免存量声音判定被还原动作洗新
-            restored_created_at = (
-                vm.get_version_created_at(resource_type, resource_id, version)
-                if resource_type == "reference_videos"
-                else None
+            # 还原参考视频时把该版本的原始入库时间一并写回，
+            # 避免存量声音判定被还原动作洗新。
+            if resource_type == "reference_videos":
+                restored_created_at = vm.get_version_created_at(resource_type, resource_id, version)
+            else:
+                restored_created_at = None
+            _sync_metadata(
+                resource_type,
+                project_name,
+                resource_id,
+                file_path,
+                project_path,
+                restored_created_at,
             )
-            _sync_metadata(resource_type, project_name, resource_id, file_path, project_path, restored_created_at)
 
             # 计算还原后文件的 fingerprint；视频还原时同步删除缩略图（内容已失效）
             asset_fingerprints: dict[str, int] = {}
