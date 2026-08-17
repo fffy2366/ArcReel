@@ -62,6 +62,10 @@ _Avoid_: 把「函数体内延迟导入」当作绕过方向约束的手段—�
 GenerationQueue 中的一条记录，承载一次媒体生成请求。状态机：`queued → running → succeeded | failed | cancelling → cancelled`。
 _Avoid_: job（无此概念）。
 
+**批量准入（batch admission）**：
+「生成全部 / 批量生成」在创建任何任务之前对本次请求全部目标做的一次性评估，Web 与 Agent 共用同一实现。三种结论：放行（同一次操作创建完整任务集合）、待确认（跨档费用按申请档位聚合，等用户拍板）、受阻（零任务创建）。任一目标不通过即整批零任务，逐目标给出稳定问题码与下一步；本身没问题的目标带 `generation_batch_admission_withheld` 并指名是谁拦下的。准入的原子性只管「这次请求该不该发生」，入队后的成败仍逐条独立、按 `requested / succeeded / failed / blocked` 契约报告，两者不互相顶替（见 `docs/adr/0061`）。
+_Avoid_: 把整批拒绝说成「批量失败」（没有任何执行发生）。
+
 **cancelling（取消中）**：
 中间状态，表示 cancel 信号已发出但 worker 内 asyncio task 尚未走完 finally 收尾。cancel API 把 DB 从 `running` 改成 `cancelling` 后立即返回；worker finally 在 mark 终态时只能从 `cancelling` 转 `cancelled`（不再走 succeeded/failed 分支）。这是状态机里唯一一个**从 `running` 出发、由 worker 之外的代码改写的非终态**——`queued` 由 enqueue API 写、`cancelled` 直接由 cancel queued 路径写都属于「外部写入」，但前者不从 running 出发、后者是终态。
 
@@ -81,6 +85,10 @@ ArcReel 中始终与 server 主进程**捆绑在同一个 uvicorn 进程内**的
 
 **孤儿任务（orphan task）**：
 DB 中状态为 `running` 但 worker 内存里没有对应 asyncio.Task 的任务。唯一现实成因是**服务重启**（部署 / 崩溃恢复）；处理原则是不重新触发生成，只有具备完整恢复身份的提交-轮询型任务才可继续轮询。
+
+**provider job status（供应商任务状态）**：
+提交-轮询型 video backend 从供应商回包读到的**远端 job** 状态，与上面 task 状态机同名不同物——它由供应商写、只决定轮询何时终止，不是 DB 里的任务状态。OpenAI 兼容协议的三个端点（`openai-video` / `newapi-video` / `v2-video-generations`）状态串不由单一厂商固定，经代理网关转发时还会透传底层厂商的写法，故过 `lib/video_backends/base.py::normalize_provider_status` 归一到五档：`queued` / `running` / `succeeded` / `failed` / `expired`；各家自有 API 的 backend 状态串由该家文档定死，仍按字面量判定。`expired` 独立于 `failed`：它决定续跑走 `[resume_expired]`（不再自愈）而非普通失败；协议本身没有过期语义的端点（`v2-video-generations`）在五档之上自行折叠。未登记的状态串按 `running` 处理继续轮询——保守方向，否则会对未就绪任务触发下载。
+_Avoid_: 与 task 状态机的 succeeded/failed 混为一谈；给未知状态串加「猜测即终态」的启发式；在 backend 里各写一份同义词判定。
 
 **execution checkpoint（执行检查点）**：
 视频任务（分镜路线与参考路线）首次向 provider 提交前冻结的单次付费请求身份与实际输入事实。它只证明「这次提交如何发生」，不是入队快照、provider job、任务状态、Artifact Manifest 写入或产物 current 标记；命中同档复用时不创建 checkpoint。
